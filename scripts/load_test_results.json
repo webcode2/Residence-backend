@@ -1,0 +1,106 @@
+{
+  "1) Health (light)": {
+    "requests": 500,
+    "concurrency": 25,
+    "success_rate": 1.0,
+    "rps": 884.8,
+    "p50_ms": 23.3,
+    "p95_ms": 44.8,
+    "p99_ms": 66.7,
+    "max_ms": 126.6,
+    "statuses": {
+      "200": 500
+    }
+  },
+  "2) Health (heavy)": {
+    "requests": 2000,
+    "concurrency": 100,
+    "success_rate": 1.0,
+    "rps": 876.4,
+    "p50_ms": 71.5,
+    "p95_ms": 184.9,
+    "p99_ms": 261.2,
+    "max_ms": 375.5,
+    "statuses": {
+      "200": 2000
+    }
+  },
+  "3) Ready (DB+Redis)": {
+    "requests": 300,
+    "concurrency": 30,
+    "success_rate": 1.0,
+    "rps": 136.9,
+    "p50_ms": 69.8,
+    "p95_ms": 1093.8,
+    "p99_ms": 1163.9,
+    "max_ms": 1174.4,
+    "statuses": {
+      "200": 300
+    }
+  },
+  "4) Subscription tiers (static)": {
+    "requests": 500,
+    "concurrency": 50,
+    "success_rate": 1.0,
+    "rps": 815.0,
+    "p50_ms": 29.3,
+    "p95_ms": 83.2,
+    "p99_ms": 109.0,
+    "max_ms": 140.9,
+    "statuses": {
+      "200": 500
+    }
+  },
+  "5) RFID verify (moderate) \u2014 hot path": {
+    "requests": 500,
+    "concurrency": 40,
+    "success_rate": 1.0,
+    "rps": 453.1,
+    "p50_ms": 65.6,
+    "p95_ms": 188.3,
+    "p99_ms": 236.8,
+    "max_ms": 262.2,
+    "statuses": {
+      "200": 500
+    }
+  },
+  "6) RFID verify (heavy) \u2014 hot path": {
+    "requests": 1500,
+    "concurrency": 80,
+    "success_rate": 1.0,
+    "rps": 502.5,
+    "p50_ms": 138.0,
+    "p95_ms": 213.7,
+    "p99_ms": 305.3,
+    "max_ms": 373.9,
+    "statuses": {
+      "200": 1500
+    }
+  },
+  "7) Auth login (bcrypt)": {
+    "requests": 100,
+    "concurrency": 20,
+    "success_rate": 1.0,
+    "rps": 8.8,
+    "p50_ms": 2233.5,
+    "p95_ms": 3643.2,
+    "p99_ms": 4835.0,
+    "max_ms": 5176.2,
+    "statuses": {
+      "200": 100
+    }
+  },
+  "8) RFID verify (spike) \u2014 peak concurrency": {
+    "requests": 800,
+    "concurrency": 150,
+    "success_rate": 1.0,
+    "rps": 490.2,
+    "p50_ms": 262.0,
+    "p95_ms": 379.2,
+    "p99_ms": 413.4,
+    "max_ms": 443.5,
+    "statuses": {
+      "200": 800
+    }
+  }
+}
