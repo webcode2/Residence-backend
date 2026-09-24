@@ -8,7 +8,15 @@ from sqlalchemy.orm import selectinload
 from app.models.estate import Estate, Subscription
 from app.models.access_log import AccessLog
 from app.models.token import VisitorToken
-from app.core.redis import invalidate_subscription_cache
+from app.models import user as _user_model  # noqa: F401
+from app.core.redis import (
+    invalidate_subscription_cache,
+    reset_monthly_quota_redis,
+    list_active_quota_app_ids,
+    get_monthly_quota_redis,
+)
+from app.services.access_logs import drain_access_log_queue
+from app.services.token_state import drain_token_state_queue
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +84,7 @@ async def reset_billing_cycles_and_check_expirations(db: AsyncSession) -> Dict[s
             cycles_reset += 1
             if app_id:
                 await invalidate_subscription_cache(app_id)
+                await reset_monthly_quota_redis(app_id)
 
         # 2. Check if subscription has expired
         if sub.status == "active" and sub.expiry_date and sub.expiry_date < today:
@@ -133,13 +142,42 @@ async def cleanup_expired_tokens(db: AsyncSession) -> Dict[str, int]:
         "bookout_codes_cleared": bookout_codes_cleared
     }
 
+async def sync_redis_quotas_to_db(db: AsyncSession) -> int:
+    """
+    Flush Redis monthly verification counters into Postgres so billing dashboards
+    stay accurate without contending on the hot path.
+    """
+    synced = 0
+    app_ids = await list_active_quota_app_ids()
+    for app_id in app_ids:
+        count = await get_monthly_quota_redis(app_id)
+        if count is None:
+            continue
+        result = await db.execute(
+            select(Subscription).join(Estate, Estate.id == Subscription.estate_id).where(Estate.app_id == app_id)
+        )
+        sub = result.scalar_one_or_none()
+        if not sub:
+            continue
+        sub.current_month_verifications = count
+        synced += 1
+
+    if synced:
+        await db.commit()
+    logger.info(f"[MAINTENANCE] Synced {synced} Redis quota counters into Postgres.")
+    return synced
+
+
 async def run_all_maintenance_jobs(db: AsyncSession) -> Dict[str, Any]:
     """Executes all scheduled background maintenance jobs in sequence."""
     logger.info("[MAINTENANCE] Starting automated platform maintenance run...")
     start_time = datetime.now(UTC).replace(tzinfo=None)
 
+    drained_logs = await drain_access_log_queue(db)
+    drained_token_states = await drain_token_state_queue(db)
     purged_logs = await purge_expired_access_logs(db)
     billing_stats = await reset_billing_cycles_and_check_expirations(db)
+    quotas_synced = await sync_redis_quotas_to_db(db)
     token_stats = await cleanup_expired_tokens(db)
 
     duration = (datetime.now(UTC).replace(tzinfo=None) - start_time).total_seconds()
@@ -148,7 +186,10 @@ async def run_all_maintenance_jobs(db: AsyncSession) -> Dict[str, Any]:
     return {
         "timestamp": start_time.isoformat(),
         "duration_seconds": round(duration, 2),
+        "access_logs_drained": drained_logs,
+        "token_states_drained": drained_token_states,
         "access_logs_purged": purged_logs,
+        "quotas_synced": quotas_synced,
         "billing_cycles_reset": billing_stats["cycles_reset"],
         "subscriptions_expired": billing_stats["subscriptions_expired"],
         "pending_tokens_expired": token_stats["pending_tokens_expired"],

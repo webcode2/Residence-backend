@@ -1,32 +1,127 @@
 import asyncio
+import logging
+from dataclasses import dataclass
 from datetime import datetime, date, UTC
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
-from sqlalchemy.orm import selectinload
+from typing import Optional, Any
+import uuid
+
 from fastapi import HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
 from app.models.user import User, UserRole
 from app.models.token import VisitorToken
 from app.models.estate import Estate, Subscription
-from app.models.access_log import AccessLog
 from app.services.notifications import notification_service
+from app.services.access_logs import record_access_event
+from app.services.token_state import persist_token_check_in, persist_token_check_out
 from app.core.redis import (
     get_cached_subscription_state,
     set_cached_subscription_state,
     increment_monthly_quota_redis,
+    reset_monthly_quota_redis,
     consume_cached_visitor_token,
-    consume_cached_bookout_token
+    consume_cached_bookout_token,
+    get_cached_rfid_user,
+    set_cached_rfid_user,
+    is_token_code_claimed,
+    claim_token_code,
+    get_token_live_status,
 )
-from typing import Optional
-import uuid
 
-async def _check_and_update_subscription(db: AsyncSession, app_id: str, is_rfid: bool) -> tuple[Estate | None, Subscription | None]:
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class GateSubscriptionState:
+    """Lightweight subscription snapshot for the gate hot path (ORM-free)."""
+    tier: str
+    status: str
+    realtime_alerts_enabled: bool
+    rfid_enabled: bool
+    monthly_verifications_limit: Optional[int]
+    estate_id: Optional[uuid.UUID] = None
+    from_cache: bool = False
+
+
+def _state_from_cache(cached: dict) -> GateSubscriptionState:
+    return GateSubscriptionState(
+        tier=cached.get("tier", "starter"),
+        status=cached.get("status", "unknown"),
+        realtime_alerts_enabled=bool(cached.get("realtime_alerts_enabled")),
+        rfid_enabled=bool(cached.get("rfid_enabled")),
+        monthly_verifications_limit=cached.get("monthly_verifications_limit"),
+        from_cache=True,
+    )
+
+
+def _state_from_sub(sub: Subscription) -> GateSubscriptionState:
+    return GateSubscriptionState(
+        tier=sub.tier,
+        status=sub.status,
+        realtime_alerts_enabled=bool(sub.realtime_alerts_enabled),
+        rfid_enabled=bool(sub.rfid_enabled),
+        monthly_verifications_limit=sub.monthly_verifications_limit,
+        estate_id=sub.estate_id,
+        from_cache=False,
+    )
+
+
+async def _enforce_quota(app_id: str, limit: Optional[int], tier: str, db: AsyncSession, is_rfid: bool) -> None:
+    """Redis-first atomic quota. DB fallback only when Redis is unavailable."""
+    allowed, count = await increment_monthly_quota_redis(app_id, limit)
+
+    # count > 0 means Redis INCR succeeded (source of truth). Do not fall back to DB.
+    if count > 0:
+        if not allowed:
+            await record_access_event(
+                db,
+                app_id=app_id,
+                event_type="rfid_verification" if is_rfid else "visitor_token_verification",
+                identifier="QUOTA_CHECK",
+                status="denied",
+                denial_reason=f"Monthly verification limit of {limit} exceeded on {tier} tier",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Monthly verification quota of {limit} exceeded on {tier} tier. Please upgrade your subscription.",
+            )
+        return
+
+    # Redis unavailable: read-modify-write on Postgres (best-effort fallback)
+    result = await db.execute(
+        select(Subscription).join(Estate, Estate.id == Subscription.estate_id).where(Estate.app_id == app_id)
+    )
+    sub = result.scalar_one_or_none()
+    if not sub:
+        return
+    if limit is not None and sub.current_month_verifications >= limit:
+        await record_access_event(
+            db,
+            app_id=app_id,
+            event_type="rfid_verification" if is_rfid else "visitor_token_verification",
+            identifier="QUOTA_CHECK",
+            status="denied",
+            denial_reason=f"Monthly verification limit of {limit} exceeded on {tier} tier",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Monthly verification quota of {limit} exceeded on {tier} tier. Please upgrade your subscription.",
+        )
+    sub.current_month_verifications += 1
+    await db.commit()
+
+
+async def _check_and_update_subscription(
+    db: AsyncSession, app_id: str, is_rfid: bool
+) -> GateSubscriptionState:
     """
     Validates subscription active status, tier features, and monthly quota.
-    Leverages Redis for sub-millisecond caching and atomic quota increments.
+    Redis cache + INCR is the hot path; DB is only used on cache miss / Redis outage.
     """
     today = date.today()
 
-    # 1. Fast path: Redis cache check
     cached = await get_cached_subscription_state(app_id)
     if cached:
         if cached.get("status") != "active":
@@ -44,106 +139,141 @@ async def _check_and_update_subscription(db: AsyncSession, app_id: str, is_rfid:
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"RFID access is not supported on your current tier ({cached.get('tier')}). Please upgrade to Standard or higher."
             )
-        # Atomic Redis quota check
-        allowed, count = await increment_monthly_quota_redis(app_id, cached.get("monthly_verifications_limit"))
-        if not allowed:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Monthly verification quota of {cached.get('monthly_verifications_limit')} exceeded on {cached.get('tier')} tier. Please upgrade your subscription."
-            )
 
-    # 2. Database path (cache miss or fallback)
+        state = _state_from_cache(cached)
+        await _enforce_quota(app_id, state.monthly_verifications_limit, state.tier, db, is_rfid)
+        return state
+
+    # Cache miss: load from Postgres once, then cache for subsequent O(1) requests
     estate_result = await db.execute(
         select(Estate).where(Estate.app_id == app_id).options(selectinload(Estate.subscription))
     )
     estate = estate_result.scalar_one_or_none()
     if not estate or not estate.subscription:
-        return estate, None
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Estate subscription not found. Access verification is disabled."
+        )
 
     sub = estate.subscription
 
-    # Check subscription status and expiry
     if sub.status != "active":
-        db.add(AccessLog(
+        await record_access_event(
+            db,
             app_id=app_id,
             event_type="rfid_verification" if is_rfid else "visitor_token_verification",
             identifier="SUB_STATUS_CHECK",
             status="denied",
-            denial_reason=f"Subscription is {sub.status}"
-        ))
-        await db.commit()
+            denial_reason=f"Subscription is {sub.status}",
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Estate subscription is {sub.status}. Access verification is disabled."
         )
 
     if sub.expiry_date < today:
-        db.add(AccessLog(
+        await record_access_event(
+            db,
             app_id=app_id,
             event_type="rfid_verification" if is_rfid else "visitor_token_verification",
             identifier="SUB_EXPIRY_CHECK",
             status="denied",
-            denial_reason="Subscription has expired"
-        ))
-        await db.commit()
+            denial_reason="Subscription has expired",
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Estate subscription has expired. Access verification is disabled."
         )
 
-    # Reset quota if 30 days have elapsed since billing cycle start
     if (today - sub.billing_cycle_start).days >= 30:
         sub.current_month_verifications = 0
         sub.billing_cycle_start = today
+        await db.commit()
+        await reset_monthly_quota_redis(app_id)
 
-    # Check RFID entitlement by tier
     if is_rfid and not sub.rfid_enabled:
-        db.add(AccessLog(
+        await record_access_event(
+            db,
             app_id=app_id,
             event_type="rfid_verification",
             identifier="RFID_SCAN",
             status="denied",
-            denial_reason=f"RFID access is disabled on {sub.tier} tier"
-        ))
-        await db.commit()
+            denial_reason=f"RFID access is disabled on {sub.tier} tier",
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"RFID access is not supported on your current tier ({sub.tier}). Please upgrade to Standard or higher."
         )
 
-    # Check monthly quota
-    if sub.monthly_verifications_limit is not None:
-        if sub.current_month_verifications >= sub.monthly_verifications_limit:
-            db.add(AccessLog(
+    await set_cached_subscription_state(app_id, {
+        "tier": sub.tier,
+        "status": sub.status,
+        "expiry_date": sub.expiry_date.isoformat(),
+        "monthly_verifications_limit": sub.monthly_verifications_limit,
+        "rfid_enabled": sub.rfid_enabled,
+        "log_retention_days": sub.log_retention_days,
+        "realtime_alerts_enabled": sub.realtime_alerts_enabled,
+    }, ttl_seconds=300)
+
+    state = _state_from_sub(sub)
+    await _enforce_quota(app_id, state.monthly_verifications_limit, state.tier, db, is_rfid)
+    return state
+
+
+async def verify_rfid_access(db: AsyncSession, rfid_tag: str, app_id: str) -> Optional[dict]:
+    sub = await _check_and_update_subscription(db, app_id, is_rfid=True)
+
+    # Fast path: Redis RFID profile
+    cached_user = await get_cached_rfid_user(app_id, rfid_tag)
+    if cached_user:
+        if cached_user.get("is_revoked"):
+            await record_access_event(
+                db,
                 app_id=app_id,
-                event_type="rfid_verification" if is_rfid else "visitor_token_verification",
-                identifier="QUOTA_CHECK",
+                event_type="rfid_verification",
+                identifier=rfid_tag,
                 status="denied",
-                denial_reason=f"Monthly verification limit of {sub.monthly_verifications_limit} exceeded on {sub.tier} tier"
-            ))
-            await db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Monthly verification quota of {sub.monthly_verifications_limit} exceeded on {sub.tier} tier. Please upgrade your subscription."
+                denial_reason="Invalid RFID tag or user revoked",
+            )
+            return None
+        if cached_user.get("landlord_id") and cached_user.get("landlord_revoked"):
+            await record_access_event(
+                db,
+                app_id=app_id,
+                event_type="rfid_verification",
+                identifier=rfid_tag,
+                status="denied",
+                denial_reason="Associated landlord revoked or inactive",
+                user_id=cached_user.get("user_id"),
+            )
+            return None
+
+        await record_access_event(
+            db,
+            app_id=app_id,
+            event_type="rfid_verification",
+            identifier=rfid_tag,
+            status="authorized",
+            user_id=cached_user.get("user_id"),
+            details="RFID authorized via Redis cache",
+        )
+
+        if sub.realtime_alerts_enabled and cached_user.get("email"):
+            asyncio.create_task(
+                notification_service.send_realtime_access_alert(
+                    cached_user["email"],
+                    "RFID Gate Entry Authorized",
+                    f"Your RFID tag was authorized for gate entry at {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}."
+                )
             )
 
-    # Cache state in Redis for subsequent O(1) requests (TTL: 5 minutes)
-    if not cached:
-        await set_cached_subscription_state(app_id, {
-            "tier": sub.tier,
-            "status": sub.status,
-            "expiry_date": sub.expiry_date.isoformat(),
-            "monthly_verifications_limit": sub.monthly_verifications_limit,
-            "rfid_enabled": sub.rfid_enabled,
-            "log_retention_days": sub.log_retention_days,
-            "realtime_alerts_enabled": sub.realtime_alerts_enabled
-        }, ttl_seconds=300)
+        return {
+            "status": "authorized",
+            "user_id": cached_user["user_id"],
+            "roles": cached_user.get("roles", []),
+        }
 
-    return estate, sub
-
-async def verify_rfid_access(db: AsyncSession, rfid_tag: str, app_id: str) -> dict:
-    estate, sub = await _check_and_update_subscription(db, app_id, is_rfid=True)
-
+    # DB path (cache miss)
     result = await db.execute(
         select(User).where(
             User.app_id == app_id,
@@ -152,49 +282,55 @@ async def verify_rfid_access(db: AsyncSession, rfid_tag: str, app_id: str) -> di
         )
     )
     user = result.scalar_one_or_none()
-    
+
     if not user:
-        db.add(AccessLog(
+        await record_access_event(
+            db,
             app_id=app_id,
             event_type="rfid_verification",
             identifier=rfid_tag,
             status="denied",
-            denial_reason="Invalid RFID tag or user revoked"
-        ))
-        await db.commit()
+            denial_reason="Invalid RFID tag or user revoked",
+        )
         return None
-        
-    # Extra check for resident hierarchy revocation
+
+    landlord_revoked = False
     if UserRole.RESIDENT in user.roles and user.landlord_id:
         land_result = await db.execute(select(User).where(User.id == user.landlord_id))
         landlord = land_result.scalar_one_or_none()
         if not landlord or landlord.is_revoked:
-            db.add(AccessLog(
+            landlord_revoked = True
+            await record_access_event(
+                db,
                 app_id=app_id,
                 event_type="rfid_verification",
                 identifier=rfid_tag,
                 status="denied",
                 denial_reason="Associated landlord revoked or inactive",
-                user_id=user.id
-            ))
-            await db.commit()
+                user_id=user.id,
+            )
             return None
 
-    # Access authorized
-    if sub:
-        sub.current_month_verifications += 1
+    roles = [r.value if hasattr(r, "value") else str(r) for r in user.roles]
+    await set_cached_rfid_user(app_id, rfid_tag, {
+        "user_id": str(user.id),
+        "email": user.email,
+        "roles": roles,
+        "landlord_id": str(user.landlord_id) if user.landlord_id else None,
+        "landlord_revoked": landlord_revoked,
+        "is_revoked": False,
+    }, ttl_seconds=120)
 
-    db.add(AccessLog(
+    await record_access_event(
+        db,
         app_id=app_id,
         event_type="rfid_verification",
         identifier=rfid_tag,
         status="authorized",
-        user_id=user.id
-    ))
-    await db.commit()
+        user_id=user.id,
+    )
 
-    # Real-time alert dispatch if enabled on the tier
-    if sub and sub.realtime_alerts_enabled and user.email:
+    if sub.realtime_alerts_enabled and user.email:
         asyncio.create_task(
             notification_service.send_realtime_access_alert(
                 user.email,
@@ -203,20 +339,20 @@ async def verify_rfid_access(db: AsyncSession, rfid_tag: str, app_id: str) -> di
             )
         )
 
-    return {"status": "authorized", "user_id": str(user.id), "roles": user.roles}
+    return {"status": "authorized", "user_id": str(user.id), "roles": roles}
+
 
 async def verify_visitor_token(
-    db: AsyncSession, 
-    code: str, 
+    db: AsyncSession,
+    code: str,
     app_id: str,
     direction: Optional[str] = None
 ) -> Optional[dict]:
     """
     Unified Single-Path Verification for Security Personnel.
-    Security guards enter the 4-digit code into ONE single screen.
-    The system automatically detects whether the code is for:
-    - ENTRY (check_in)
-    - EXIT (book_out)
+
+    One-time use is enforced in Redis (cache GETDEL + claim keys).
+    Postgres mark-used / check-out writes are enqueued for the worker.
     """
     if direction:
         direction = direction.lower().strip()
@@ -224,40 +360,40 @@ async def verify_visitor_token(
             direction = None
 
     code = code.upper().strip()
-    estate, sub = await _check_and_update_subscription(db, app_id, is_rfid=False)
+    sub = await _check_and_update_subscription(db, app_id, is_rfid=False)
     now = datetime.now(UTC).replace(tzinfo=None)
 
-    # -------------------------------------------------------------------------
-    # Path A: BOOK-OUT (EXIT) Check (unless caller explicitly restricted to entry)
-    # -------------------------------------------------------------------------
     if direction != "entry":
-        # 1. Fast Path: Redis Book-Out Cache
         cached_bookout = await consume_cached_bookout_token(app_id, code)
         if cached_bookout:
             token_id = uuid.UUID(cached_bookout["token_id"])
             resident_id = uuid.UUID(cached_bookout["resident_id"])
             visitor_name = cached_bookout["visitor_name"]
 
-            await db.execute(
-                update(VisitorToken)
-                .where(VisitorToken.id == token_id)
-                .values(status="checked_out", checked_out_at=now)
+            await claim_token_code(app_id, code)
+            ok = await persist_token_check_out(
+                db,
+                token_id=token_id,
+                app_id=app_id,
+                code=code,
+                at=now,
+                already_claimed=True,
             )
-            if sub:
-                sub.current_month_verifications += 1
+            if not ok:
+                return None
 
-            db.add(AccessLog(
+            await record_access_event(
+                db,
                 app_id=app_id,
                 event_type="bookout_verification",
                 identifier=code,
                 status="authorized",
                 resident_id=resident_id,
                 visitor_name=visitor_name,
-                details="Exit book-out authorized via Redis fresh cache (< 20m)"
-            ))
-            await db.commit()
+                details="Exit book-out authorized via Redis fresh cache (< 20m); Postgres write queued",
+            )
 
-            if sub and sub.realtime_alerts_enabled and resident_id:
+            if sub.realtime_alerts_enabled and resident_id:
                 res_result = await db.execute(select(User).where(User.id == resident_id))
                 resident = res_result.scalar_one_or_none()
                 if resident and resident.email:
@@ -278,7 +414,6 @@ async def verify_visitor_token(
                 "message": "Exit authorized (Book-Out successful)"
             }
 
-        # 2. Database Path for Book-Out
         bookout_res = await db.execute(
             select(VisitorToken).where(
                 VisitorToken.bookout_code == code,
@@ -290,33 +425,44 @@ async def verify_visitor_token(
         bookout_token = bookout_res.scalar_one_or_none()
 
         if not bookout_token and direction == "exit":
-            # Exit barrier / security terminal fallback: allow checkout via original token code
+            # Exit via original entry code — honor live Redis check-in (Postgres may lag)
             alt_res = await db.execute(
                 select(VisitorToken).where(
                     VisitorToken.code == code,
                     VisitorToken.app_id == app_id,
-                    VisitorToken.status == "checked_in"
                 )
             )
-            bookout_token = alt_res.scalar_one_or_none()
+            candidate = alt_res.scalar_one_or_none()
+            if candidate:
+                live = await get_token_live_status(str(candidate.id))
+                effective = (live or {}).get("status") or candidate.status
+                if effective == "checked_in":
+                    bookout_token = candidate
         if bookout_token:
-            bookout_token.status = "checked_out"
-            bookout_token.checked_out_at = now
-            if sub:
-                sub.current_month_verifications += 1
+            if await is_token_code_claimed(app_id, code):
+                return None
+            ok = await persist_token_check_out(
+                db,
+                token_id=bookout_token.id,
+                app_id=app_id,
+                code=code,
+                at=now,
+            )
+            if not ok:
+                return None
 
-            db.add(AccessLog(
+            await record_access_event(
+                db,
                 app_id=app_id,
                 event_type="bookout_verification",
                 identifier=code,
                 status="authorized",
                 resident_id=bookout_token.resident_id,
                 visitor_name=bookout_token.visitor_name,
-                details="Exit book-out authorized via PostgreSQL lookup"
-            ))
-            await db.commit()
+                details="Exit book-out authorized via PostgreSQL lookup; Postgres write queued",
+            )
 
-            if sub and sub.realtime_alerts_enabled and bookout_token.resident_id:
+            if sub.realtime_alerts_enabled and bookout_token.resident_id:
                 res_result = await db.execute(select(User).where(User.id == bookout_token.resident_id))
                 resident = res_result.scalar_one_or_none()
                 if resident and resident.email:
@@ -337,37 +483,49 @@ async def verify_visitor_token(
                 "message": "Exit authorized (Book-Out successful)"
             }
 
-    # -------------------------------------------------------------------------
-    # Path B: ENTRY Check (unless caller explicitly restricted to exit)
-    # -------------------------------------------------------------------------
     if direction != "exit":
-        # 1. Fast Path: Redis Entry Token Cache
+        # Reject codes already claimed (queued write not yet flushed)
+        if await is_token_code_claimed(app_id, code):
+            await record_access_event(
+                db,
+                app_id=app_id,
+                event_type="visitor_token_verification",
+                identifier=code,
+                status="denied",
+                denial_reason="Invalid, expired, or already used visitor token/book-out code",
+            )
+            return None
+
         cached_entry = await consume_cached_visitor_token(app_id, code)
         if cached_entry:
             token_id = uuid.UUID(cached_entry["id"])
             resident_id = uuid.UUID(cached_entry["resident_id"])
             visitor_name = cached_entry["visitor_name"]
 
-            await db.execute(
-                update(VisitorToken)
-                .where(VisitorToken.id == token_id)
-                .values(is_used=True, status="checked_in", checked_in_at=now)
+            await claim_token_code(app_id, code)
+            ok = await persist_token_check_in(
+                db,
+                token_id=token_id,
+                app_id=app_id,
+                code=code,
+                at=now,
+                already_claimed=True,
             )
-            if sub:
-                sub.current_month_verifications += 1
+            if not ok:
+                return None
 
-            db.add(AccessLog(
+            await record_access_event(
+                db,
                 app_id=app_id,
                 event_type="visitor_token_verification",
                 identifier=code,
                 status="authorized",
                 resident_id=resident_id,
                 visitor_name=visitor_name,
-                details="Fast-path entry verification via Redis fresh cache (< 20m)"
-            ))
-            await db.commit()
+                details="Fast-path entry verification via Redis fresh cache (< 20m); Postgres write queued",
+            )
 
-            if sub and sub.realtime_alerts_enabled and resident_id:
+            if sub.realtime_alerts_enabled and resident_id:
                 res_result = await db.execute(select(User).where(User.id == resident_id))
                 resident = res_result.scalar_one_or_none()
                 if resident and resident.email:
@@ -388,7 +546,6 @@ async def verify_visitor_token(
                 "message": "Entry authorized (Check-In successful)"
             }
 
-        # 2. Database Path for Entry
         entry_res = await db.execute(
             select(VisitorToken).where(
                 VisitorToken.code == code,
@@ -399,24 +556,28 @@ async def verify_visitor_token(
         )
         entry_token = entry_res.scalar_one_or_none()
         if entry_token:
-            entry_token.is_used = True
-            entry_token.status = "checked_in"
-            entry_token.checked_in_at = now
-            if sub:
-                sub.current_month_verifications += 1
+            ok = await persist_token_check_in(
+                db,
+                token_id=entry_token.id,
+                app_id=app_id,
+                code=code,
+                at=now,
+            )
+            if not ok:
+                return None
 
-            db.add(AccessLog(
+            await record_access_event(
+                db,
                 app_id=app_id,
                 event_type="visitor_token_verification",
                 identifier=code,
                 status="authorized",
                 resident_id=entry_token.resident_id,
                 visitor_name=entry_token.visitor_name,
-                details="Standard entry verification via PostgreSQL lookup"
-            ))
-            await db.commit()
+                details="Standard entry verification via PostgreSQL lookup; Postgres write queued",
+            )
 
-            if sub and sub.realtime_alerts_enabled and entry_token.resident_id:
+            if sub.realtime_alerts_enabled and entry_token.resident_id:
                 res_result = await db.execute(select(User).where(User.id == entry_token.resident_id))
                 resident = res_result.scalar_one_or_none()
                 if resident and resident.email:
@@ -437,18 +598,16 @@ async def verify_visitor_token(
                 "message": "Entry authorized (Check-In successful)"
             }
 
-    # -------------------------------------------------------------------------
-    # Neither matched -> Access Denied
-    # -------------------------------------------------------------------------
-    db.add(AccessLog(
+    await record_access_event(
+        db,
         app_id=app_id,
         event_type="visitor_token_verification",
         identifier=code,
         status="denied",
-        denial_reason="Invalid, expired, or already used visitor token/book-out code"
-    ))
-    await db.commit()
+        denial_reason="Invalid, expired, or already used visitor token/book-out code",
+    )
     return None
+
 
 async def verify_bookout_token(db: AsyncSession, code: str, app_id: str) -> Optional[dict]:
     """Alias for backwards compatibility and dedicated exit barrier hardware."""

@@ -14,9 +14,15 @@ from app.schemas.subscription import (
 from app.services import estates as estate_service
 from app.dependencies import validate_tenant, check_roles, get_current_user
 from app.models.user import User, UserRole
+from app.core.redis import get_monthly_quota_redis
 
 
 router = APIRouter()
+
+async def _usage_count(app_id: str, db_count: int) -> int:
+    """Prefer live Redis quota; fall back to last flushed DB value."""
+    redis_count = await get_monthly_quota_redis(app_id)
+    return redis_count if redis_count is not None else db_count
 
 @router.get("/tiers", response_model=List[TierInfoSchema])
 async def list_available_tiers():
@@ -40,9 +46,10 @@ async def get_current_subscription(
         raise HTTPException(status_code=404, detail="Subscription not found for this estate")
 
     sub = estate.subscription
+    used = await _usage_count(app_id, sub.current_month_verifications)
     remaining = None
     if sub.monthly_verifications_limit is not None:
-        remaining = max(0, sub.monthly_verifications_limit - sub.current_month_verifications)
+        remaining = max(0, sub.monthly_verifications_limit - used)
 
     return SubscriptionDetailSchema(
         id=sub.id,
@@ -51,7 +58,7 @@ async def get_current_subscription(
         expiry_date=sub.expiry_date,
         tier=sub.tier,
         monthly_verifications_limit=sub.monthly_verifications_limit,
-        current_month_verifications=sub.current_month_verifications,
+        current_month_verifications=used,
         verifications_remaining=remaining,
         billing_cycle_start=sub.billing_cycle_start,
         rfid_enabled=sub.rfid_enabled,
@@ -72,9 +79,10 @@ async def change_subscription_tier(
     Only accessible by Caretakers (Estate Admins).
     """
     sub = await estate_service.change_estate_tier(db, app_id, req.tier)
+    used = await _usage_count(app_id, sub.current_month_verifications)
     remaining = None
     if sub.monthly_verifications_limit is not None:
-        remaining = max(0, sub.monthly_verifications_limit - sub.current_month_verifications)
+        remaining = max(0, sub.monthly_verifications_limit - used)
 
     return SubscriptionDetailSchema(
         id=sub.id,
@@ -83,7 +91,7 @@ async def change_subscription_tier(
         expiry_date=sub.expiry_date,
         tier=sub.tier,
         monthly_verifications_limit=sub.monthly_verifications_limit,
-        current_month_verifications=sub.current_month_verifications,
+        current_month_verifications=used,
         verifications_remaining=remaining,
         billing_cycle_start=sub.billing_cycle_start,
         rfid_enabled=sub.rfid_enabled,

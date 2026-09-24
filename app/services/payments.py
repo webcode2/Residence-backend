@@ -184,6 +184,8 @@ class BachsPaymentService:
 
         await db.commit()
         await invalidate_subscription_cache(app_id)
+        from app.core.redis import reset_monthly_quota_redis
+        await reset_monthly_quota_redis(app_id)
         await db.refresh(sub)
 
         logger.info(

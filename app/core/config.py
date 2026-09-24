@@ -1,12 +1,26 @@
 from pydantic_settings import BaseSettings
-from pydantic import ConfigDict, model_validator
-from typing import List, Union
+from pydantic import ConfigDict, model_validator, field_validator
+from typing import List, Union, Any
+import json
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Residence SaaS"
     API_V1_STR: str = "/api/v1"
     ENVIRONMENT: str = "development" # "development", "staging", "production"
-    ALLOWED_ORIGINS: List[str] = ["*"]
+    ALLOWED_ORIGINS: Union[List[str], str] = ["*"]
+
+    @field_validator("ALLOWED_ORIGINS", mode="before")
+    @classmethod
+    def assemble_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
+        if isinstance(v, str):
+            v_clean = v.strip().strip("'\"")
+            if v_clean.startswith("[") and v_clean.endswith("]"):
+                try:
+                    return json.loads(v_clean)
+                except Exception:
+                    pass
+            return [i.strip() for i in v_clean.split(",") if i.strip()]
+        return v
 
     SECRET_KEY: str = "supersecretkey" # Change in production
     ALGORITHM: str = "HS256"
@@ -21,7 +35,13 @@ class Settings(BaseSettings):
     POSTGRES_USER: str = "postgres"
     POSTGRES_PASSWORD: str = "postgres"
     POSTGRES_DB: str = "residence_db"
+    # App traffic (prefer PgBouncer in production). Migrations use DIRECT_DATABASE_URL.
     DATABASE_URL: str | None = None
+    DIRECT_DATABASE_URL: str | None = None
+    DB_USE_PGBOUNCER: bool = False
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 5
+    DB_POOL_RECYCLE: int = 300
     REDIS_URL: str = "redis://localhost:6379/0"
 
     # Resend Settings
@@ -38,15 +58,39 @@ class Settings(BaseSettings):
     # Automated Maintenance & Cron Settings
     ENABLE_MAINTENANCE_SCHEDULER: bool = True
     MAINTENANCE_INTERVAL_SECONDS: int = 3600  # Run maintenance routines every hour
+    ACCESS_LOG_DRAIN_INTERVAL_SECONDS: float = 2.0
+    ACCESS_LOG_DRAIN_BATCH_SIZE: int = 500
+    TOKEN_STATE_DRAIN_INTERVAL_SECONDS: float = 2.0
+    TOKEN_STATE_DRAIN_BATCH_SIZE: int = 500
 
+    @field_validator("ENABLE_MAINTENANCE_SCHEDULER", mode="before")
+    @classmethod
+    def assemble_bool_scheduler(cls, v: Any) -> bool:
+        if isinstance(v, str):
+            v_clean = v.strip().strip("'\"").lower()
+            return v_clean in ("true", "1", "yes", "t", "on")
+        return bool(v)
 
-
+    @field_validator("DB_USE_PGBOUNCER", mode="before")
+    @classmethod
+    def assemble_bool_pgbouncer(cls, v: Any) -> bool:
+        if isinstance(v, str):
+            v_clean = v.strip().strip("'\"").lower()
+            return v_clean in ("true", "1", "yes", "t", "on")
+        return bool(v)
 
     @property
     def async_database_url(self) -> str:
         if self.DATABASE_URL:
             return self.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
         return f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}/{self.POSTGRES_DB}"
+
+    @property
+    def async_direct_database_url(self) -> str:
+        """Direct Postgres URL for Alembic / admin ops (bypass PgBouncer)."""
+        if self.DIRECT_DATABASE_URL:
+            return self.DIRECT_DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
+        return self.async_database_url
 
     @model_validator(mode="after")
     def validate_production_secrets(self):

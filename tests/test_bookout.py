@@ -58,6 +58,10 @@ async def test_full_visitor_lifecycle_and_bookout(client, db_session):
     assert resp_entry.json()["status"] == "authorized"
     assert resp_entry.json()["action"] == "check_in"
 
+    # Flush queued Postgres mark-used write (Redis-unavailable tests write sync)
+    from app.services.token_state import drain_token_state_queue
+    await drain_token_state_queue(db_session)
+
     # Verify status changed to 'checked_in' in database
     token_db = await db_session.get(VisitorToken, uuid.UUID(token_id))
     await db_session.refresh(token_db)
@@ -78,6 +82,8 @@ async def test_full_visitor_lifecycle_and_bookout(client, db_session):
     assert resp_exit_unified.status_code == 200
     assert resp_exit_unified.json()["status"] == "authorized"
     assert resp_exit_unified.json()["action"] == "book_out"
+
+    await drain_token_state_queue(db_session)
 
     # Verify status updated to 'checked_out'
     await db_session.refresh(token_db)

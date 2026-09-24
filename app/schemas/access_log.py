@@ -24,3 +24,6 @@ class AccessLogHistoryResponseSchema(BaseModel):
     earliest_accessible_date: datetime
     total_returned: int
     logs: List[AccessLogSchema]
+
+# Alias for backwards compatibility with admin endpoint
+AccessLogResponseSchema = AccessLogSchema

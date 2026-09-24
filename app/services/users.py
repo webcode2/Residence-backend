@@ -105,16 +105,20 @@ async def update_user(db: AsyncSession, user_id: uuid.UUID, user_in: UserUpdateS
     update_data = user_in.model_dump(exclude_unset=True)
     if "password" in update_data:
         update_data["hashed_password"] = get_password_hash(update_data.pop("password"))
-        
+
+    old_rfid = db_obj.rfid_tag
     for field, value in update_data.items():
         setattr(db_obj, field, value)
         
     await db.commit()
     await db.refresh(db_obj)
 
-    # Invalidate Redis user session cache so next request fetches fresh data
-    from app.core.redis import invalidate_cached_user
+    # Invalidate Redis user session + RFID caches
+    from app.core.redis import invalidate_cached_user, invalidate_cached_rfid_user
     await invalidate_cached_user(app_id, db_obj.email)
+    await invalidate_cached_rfid_user(app_id, old_rfid)
+    if db_obj.rfid_tag and db_obj.rfid_tag != old_rfid:
+        await invalidate_cached_rfid_user(app_id, db_obj.rfid_tag)
 
     return db_obj
 
@@ -124,11 +128,12 @@ async def delete_user(db: AsyncSession, user_id: uuid.UUID, app_id: str) -> bool
         return False
     
     email = db_obj.email
+    rfid_tag = db_obj.rfid_tag
     await db.delete(db_obj)
     await db.commit()
 
-    # Invalidate Redis user session cache
-    from app.core.redis import invalidate_cached_user
+    from app.core.redis import invalidate_cached_user, invalidate_cached_rfid_user
     await invalidate_cached_user(app_id, email)
+    await invalidate_cached_rfid_user(app_id, rfid_tag)
 
     return True

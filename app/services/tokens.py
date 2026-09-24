@@ -1,10 +1,10 @@
+from typing import Optional, Dict, Any, Tuple, List
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 from app.models.token import RegistrationToken, VisitorToken
 from app.models.estate import Estate, Subscription
 from app.models.user import User
-from app.models.access_log import AccessLog
 from app.services.notifications import notification_service
 from app.schemas.token import VisitorTokenCreateSchema, BookOutTokenResponseSchema
 from app.core.redis import (
@@ -12,7 +12,9 @@ from app.core.redis import (
     cache_registration_token,
     invalidate_cached_registration_token,
     cache_bookout_token,
-    consume_cached_bookout_token
+    consume_cached_bookout_token,
+    get_token_live_status,
+    is_token_code_claimed,
 )
 from datetime import datetime, timedelta, date, UTC
 from fastapi import HTTPException, status
@@ -43,10 +45,14 @@ async def is_visitor_code_active(db: AsyncSession, app_id: str, candidate_code: 
     Checks if candidate_code is currently in use in this estate by:
     1. Any active entry visitor token (status in ['pending', 'checked_in'] and not expired).
     2. Any active book-out token (status == 'checked_in', bookout_expires_at > now).
+    3. Any code recently claimed at the gate (Postgres write may still be queued).
     Enforces cross-namespace uniqueness so no active entry code ever matches an active exit code!
     """
     now = datetime.now(UTC).replace(tzinfo=None)
     clean_code = candidate_code.upper().strip()
+
+    if await is_token_code_claimed(app_id, clean_code):
+        return True
 
     # Check active entry tokens (pending or checked_in)
     entry_stmt = select(VisitorToken.id).where(
@@ -133,10 +139,16 @@ async def _validate_subscription_for_tokens(
     if (today - sub.billing_cycle_start).days >= 30:
         sub.current_month_verifications = 0
         sub.billing_cycle_start = today
+        from app.core.redis import reset_monthly_quota_redis
+        await reset_monthly_quota_redis(app_id)
 
-    # 4. For visitor tokens, check if monthly quota is already exhausted
+    # 4. For visitor tokens, check if monthly quota is already exhausted (Redis-first)
     if is_visitor_token and sub.monthly_verifications_limit is not None:
-        if sub.current_month_verifications >= sub.monthly_verifications_limit:
+        from app.core.redis import get_monthly_quota_redis
+        used = await get_monthly_quota_redis(app_id)
+        if used is None:
+            used = sub.current_month_verifications
+        if used >= sub.monthly_verifications_limit:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Monthly verification quota ({sub.monthly_verifications_limit}) reached on {sub.tier} tier. Upgrade your plan to generate more visitor tokens."
@@ -263,13 +275,16 @@ async def create_bookout_token(
             detail="Access denied: you can only generate book-out tokens for your own visitors"
         )
 
-    # State validation
-    if token.status == "pending":
+    # State validation — honor live Redis status (check-in may still be queued for Postgres)
+    live = await get_token_live_status(str(token.id))
+    effective_status = (live or {}).get("status") or token.status
+
+    if effective_status == "pending":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot book out: visitor has not checked in at the entry gate yet"
         )
-    if token.status == "checked_out":
+    if effective_status == "checked_out":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Visitor has already checked out of the estate"
@@ -304,7 +319,7 @@ async def create_bookout_token(
         "token_id": token.id,
         "visitor_name": token.visitor_name,
         "bookout_code": bookout_code,
-        "status": token.status,
+        "status": effective_status,
         "expires_at": expires_at,
         "message": "Present this 4-digit code at the exit gate to book out."
     }
@@ -334,36 +349,47 @@ async def direct_security_checkout(
             detail="Visitor token not found"
         )
 
-    if token.status == "pending":
+    live = await get_token_live_status(str(token.id))
+    effective_status = (live or {}).get("status") or token.status
+
+    if effective_status == "pending":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot book out: visitor has not checked in at the entry gate yet"
         )
-    if token.status == "checked_out":
+    if effective_status == "checked_out":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Visitor has already checked out of the estate"
         )
 
     now = datetime.now(UTC).replace(tzinfo=None)
-    token.status = "checked_out"
-    token.checked_out_at = now
+    # Queue Postgres write via live status + enqueue pattern used by gate verify
+    from app.services.token_state import persist_token_check_out
+    await persist_token_check_out(
+        db,
+        token_id=token.id,
+        app_id=app_id,
+        code=token.bookout_code or token.code,
+        at=now,
+        already_claimed=True,
+    )
 
     # Invalidate any cached bookout code in redis
     if token.bookout_code:
         await consume_cached_bookout_token(app_id, token.bookout_code)
 
-    db.add(AccessLog(
+    from app.services.access_logs import record_access_event
+    await record_access_event(
+        db,
         app_id=app_id,
         event_type="bookout_verification",
         identifier=token.code,
         status="authorized",
         resident_id=token.resident_id,
         visitor_name=token.visitor_name,
-        details=f"Direct book-out checkout by security personnel ({guard_id})"
-    ))
-    await db.commit()
-    await db.refresh(token)
+        details=f"Direct book-out checkout by security personnel ({guard_id})",
+    )
 
     # Real-time departure alert to host resident
     res_result = await db.execute(select(User).where(User.id == token.resident_id))
@@ -383,8 +409,8 @@ async def direct_security_checkout(
         "token_id": token.id,
         "visitor_name": token.visitor_name,
         "resident_id": token.resident_id,
-        "checked_in_at": token.checked_in_at,
-        "checked_out_at": token.checked_out_at,
+        "checked_in_at": token.checked_in_at or (live or {}).get("checked_in_at"),
+        "checked_out_at": now,
         "message": f"Visitor {token.visitor_name} successfully booked out by security"
     }
 

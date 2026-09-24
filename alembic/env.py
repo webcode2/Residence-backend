@@ -22,7 +22,7 @@ from app.models import estate, user, token, access_log # import all models
 target_metadata = Base.metadata
 
 from app.core.config import settings
-config.set_main_option("sqlalchemy.url", settings.async_database_url)
+config.set_main_option("sqlalchemy.url", settings.async_direct_database_url)
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode.
@@ -63,7 +63,7 @@ async def run_migrations_online() -> None:
 
     """
     configuration = config.get_section(config.config_ini_section)
-    configuration["sqlalchemy.url"] = settings.async_database_url
+    configuration["sqlalchemy.url"] = settings.async_direct_database_url
     connectable = async_engine_from_config(
         configuration,
         prefix="sqlalchemy.",

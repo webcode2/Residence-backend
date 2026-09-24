@@ -13,7 +13,7 @@ from app.schemas.admin import (
     AdminUserDetailSchema
 )
 from app.core.tiers import SubscriptionTier, get_tier_config
-from app.core.redis import invalidate_subscription_cache, invalidate_cached_user, set_cached_estate_validity
+from app.core.redis import invalidate_subscription_cache, invalidate_cached_user, set_cached_estate_validity, invalidate_cached_rfid_user
 from datetime import datetime, UTC
 from fastapi import HTTPException, status
 import uuid
@@ -283,8 +283,16 @@ async def set_user_revocation_admin(db: AsyncSession, user_id: uuid.UUID, is_rev
     await db.commit()
     await db.refresh(user)
 
-    # Invalidate Redis cache
+    # Invalidate Redis caches for this user
     await invalidate_cached_user(user.app_id, user.email)
+    await invalidate_cached_rfid_user(user.app_id, user.rfid_tag)
+
+    # Landlord revocation must invalidate resident RFID caches immediately
+    if UserRole.LANDLORD in user.roles:
+        residents = await db.execute(select(User).where(User.landlord_id == user.id))
+        for resident in residents.scalars().all():
+            await invalidate_cached_rfid_user(user.app_id, resident.rfid_tag)
+            await invalidate_cached_user(user.app_id, resident.email)
 
     return {
         "id": user.id,
