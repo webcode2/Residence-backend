@@ -1,0 +1,92 @@
+name: Residence Backend CI
+
+on:
+  push:
+    branches: [main, master, staging]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: Run Unit & Integration Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgrespassword
+          POSTGRES_DB: residence_test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx
+
+      - name: Compile and Syntax Check
+        run: |
+          python -m py_compile $(find app/ -name "*.py") worker.py seed.py init_db.py
+
+      - name: Run Database Migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgrespassword@localhost:5432/residence_test_db
+        run: |
+          alembic upgrade head
+
+      - name: Run Pytest Suite
+        env:
+          ENVIRONMENT: test
+          SECRET_KEY: test_secret_key_ci_environment_32chars_min
+          SAAS_ADMIN_SECRET_KEY: test_saas_admin_secret_key_ci_32chars
+          SAAS_ADMIN_PASSWORD_PEPPER: test_saas_admin_password_pepper_ci
+          DATABASE_URL: postgresql+asyncpg://postgres:postgrespassword@localhost:5432/residence_test_db
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          pytest -v
+
+  docker-build:
+    name: Validate Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: residence-backend:ci-test

@@ -36,5 +36,20 @@ class VisitorTokenSchema(VisitorTokenBaseSchema):
     id: uuid.UUID
     is_used: bool
     created_at: datetime
+    status: str = "pending"
+    checked_in_at: Optional[datetime] = None
+    checked_out_at: Optional[datetime] = None
+    bookout_code: Optional[str] = None
+    bookout_expires_at: Optional[datetime] = None
     
+    model_config = ConfigDict(from_attributes=True)
+
+class BookOutTokenResponseSchema(BaseModel):
+    token_id: uuid.UUID
+    visitor_name: str
+    bookout_code: str
+    status: str
+    expires_at: datetime
+    message: str = "Present this 4-digit code at the exit gate to book out."
+
     model_config = ConfigDict(from_attributes=True)

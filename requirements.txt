@@ -9,3 +9,5 @@ alembic
 pytest
 pytest-asyncio
 httpx
+redis>=5.0.0
+gunicorn>=22.0.0

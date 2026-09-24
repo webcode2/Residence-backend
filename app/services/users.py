@@ -111,6 +111,11 @@ async def update_user(db: AsyncSession, user_id: uuid.UUID, user_in: UserUpdateS
         
     await db.commit()
     await db.refresh(db_obj)
+
+    # Invalidate Redis user session cache so next request fetches fresh data
+    from app.core.redis import invalidate_cached_user
+    await invalidate_cached_user(app_id, db_obj.email)
+
     return db_obj
 
 async def delete_user(db: AsyncSession, user_id: uuid.UUID, app_id: str) -> bool:
@@ -118,6 +123,12 @@ async def delete_user(db: AsyncSession, user_id: uuid.UUID, app_id: str) -> bool
     if not db_obj:
         return False
     
+    email = db_obj.email
     await db.delete(db_obj)
     await db.commit()
+
+    # Invalidate Redis user session cache
+    from app.core.redis import invalidate_cached_user
+    await invalidate_cached_user(app_id, email)
+
     return True

@@ -18,7 +18,7 @@ if config.config_file_name is not None:
 # add your model's MetaData object here
 # for 'autogenerate' support
 from app.core.database import Base
-from app.models import estate, user, token, billings # import all models
+from app.models import estate, user, token, access_log # import all models
 target_metadata = Base.metadata
 
 from app.core.config import settings

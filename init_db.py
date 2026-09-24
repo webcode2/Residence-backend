@@ -4,7 +4,7 @@ from app.core.database import engine, Base
 from app.models.estate import Estate, Subscription
 from app.models.user import User
 from app.models.token import RegistrationToken, VisitorToken
-from app.models.billings import Billing
+from app.models.access_log import AccessLog
 
 async def init_db():
     async with engine.begin() as conn:

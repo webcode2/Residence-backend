@@ -4,9 +4,12 @@ from app.core.config import settings
 
 engine = create_async_engine(
     settings.async_database_url,
-    echo=True,
+    echo=(settings.ENVIRONMENT.lower() == "development"),
     future=True,
     pool_pre_ping=True,
+    pool_size=20,
+    max_overflow=10,
+    pool_recycle=1800,
 )
 
 SessionLocal = async_sessionmaker(
@@ -24,9 +27,9 @@ async def get_db():
     async with SessionLocal() as session:
         try:
             yield session
-            await session.commit()
         except Exception:
             await session.rollback()
             raise
         finally:
             await session.close()
+

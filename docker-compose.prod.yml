@@ -1,0 +1,88 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: residence_prod_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-residence_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-residence_db}
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+    networks:
+      - residence_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-residence_user} -d ${POSTGRES_DB:-residence_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: residence_prod_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}
+    volumes:
+      - redis_prod_data:/data
+    networks:
+      - residence_internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: residence_prod_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-residence_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-residence_db}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - ENABLE_MAINTENANCE_SCHEDULER=false
+    ports:
+      - "8000:8000"
+    networks:
+      - residence_internal
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: residence_prod_worker
+    restart: unless-stopped
+    command: ["python", "worker.py", "--daemon"]
+    env_file:
+      - .env
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-residence_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-residence_db}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - SKIP_MIGRATIONS=1
+    networks:
+      - residence_internal
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  postgres_prod_data:
+  redis_prod_data:
+
+networks:
+  residence_internal:
+    driver: bridge

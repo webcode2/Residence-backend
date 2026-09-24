@@ -66,3 +66,48 @@ async def test_login_invalid_credentials(client, db_session):
     
     assert response.status_code == 401
     assert "incorrect email or password" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_redis_cached_jwt_and_logout(client, db_session):
+    # 1. Setup Estate and Caretaker
+    estate_id = uuid.uuid4()
+    app_id = f"RP-{estate_id.hex[:5].upper()}"
+    estate = Estate(id=estate_id, app_id=app_id, name="Redis Auth Estate")
+    db_session.add(estate)
+    sub = Subscription(estate_id=estate_id, status="active", expiry_date=(datetime.now(UTC).replace(tzinfo=None) + timedelta(days=30)).date())
+    db_session.add(sub)
+
+    user = User(
+        email="caretaker@redisauth.com",
+        full_name="Caretaker Boss",
+        hashed_password=get_password_hash("pass123"),
+        roles=[UserRole.CARETAKER],
+        app_id=app_id
+    )
+    db_session.add(user)
+    await db_session.commit()
+
+    # 2. Login
+    headers = {"X-App-Id": app_id}
+    login_resp = await client.post("/api/v1/auth/login", json={"email": "caretaker@redisauth.com", "password": "pass123"}, headers=headers)
+    assert login_resp.status_code == 200
+    token = login_resp.json()["token"]["access_token"]
+    user_id = login_resp.json()["user"]["id"]
+
+    # 3. Authenticated request using JWT - loads from Redis cache
+    auth_headers = {"Authorization": f"Bearer {token}", "X-App-Id": app_id}
+    resp = await client.get(f"/api/v1/users/{user_id}", headers=auth_headers)
+    assert resp.status_code == 200
+    assert resp.json()["email"] == "caretaker@redisauth.com"
+
+    # 4. Logout (blacklists token in Redis and invalidates user cache)
+    logout_resp = await client.post("/api/v1/auth/logout", headers=auth_headers)
+    assert logout_resp.status_code == 200
+    assert "logged out" in logout_resp.json()["message"].lower()
+
+    # 5. Subsequent request with the same token MUST be rejected (401)
+    reused_resp = await client.get(f"/api/v1/users/{user_id}", headers=auth_headers)
+    assert reused_resp.status_code == 401
+    assert "revoked or logged out" in reused_resp.json()["detail"].lower()
+

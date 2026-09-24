@@ -5,7 +5,8 @@ from app.core.database import SessionLocal, engine
 from app.models.estate import Estate, Subscription
 from app.models.user import User, UserRole
 from app.models.token import RegistrationToken, VisitorToken
-from app.services.auth import get_password_hash
+from app.core.tiers import SubscriptionTier, get_tier_config
+from app.services.auth import get_password_hash, get_saas_admin_password_hash
 from app.services.tokens import generate_registration_code, generate_visitor_code
 import uuid
 
@@ -22,21 +23,39 @@ async def seed_data():
         )
         db.add(estate)
         
-        # 2. Create Subscription
+        # 2. Create Subscription (Standard Tier: $30/mo, 50k quota, RFID, Real-time alerts, 90-day retention)
+        tier_cfg = get_tier_config(SubscriptionTier.STANDARD)
         subscription = Subscription(
             estate_id=estate_id,
             status="active",
-        expiry_date=(datetime.now(UTC).replace(tzinfo=None) + timedelta(days=365)).date()
+            expiry_date=(datetime.now(UTC).replace(tzinfo=None) + timedelta(days=365)).date(),
+            tier=tier_cfg["tier"],
+            monthly_verifications_limit=tier_cfg["monthly_verifications_limit"],
+            current_month_verifications=0,
+            rfid_enabled=tier_cfg["rfid_enabled"],
+            log_retention_days=tier_cfg["log_retention_days"],
+            realtime_alerts_enabled=tier_cfg["realtime_alerts_enabled"],
+            price_monthly=tier_cfg["price_monthly"]
         )
         db.add(subscription)
         
-        # 3. Create SaaS Owner (Global context for this tenant)
-        saas_owner = User(
+        # 3. Create Estate Caretaker (Estate Admin)
+        estate_admin = User(
             email="admin@greenview.com",
             full_name="Estate Admin",
             hashed_password=get_password_hash("admin123"),
-            roles=[UserRole.CARETAKER], # Estate Admin
+            roles=[UserRole.CARETAKER],
             app_id=app_id
+        )
+        db.add(estate_admin)
+
+        # 3b. Create SaaS Platform Owner (Global Super Admin)
+        saas_owner = User(
+            email="owner@residencesaas.com",
+            full_name="Platform Super Admin",
+            hashed_password=get_saas_admin_password_hash("superadmin123"),
+            roles=[UserRole.SAAS_OWNER],
+            app_id="GLOBAL"
         )
         db.add(saas_owner)
         
@@ -84,6 +103,7 @@ async def seed_data():
         
         await db.commit()
         print(f"Seeding complete for app_id: {app_id}")
+        print(f"Plan Tier: Standard ($30/mo | 50,000 verifications/mo | RFID Enabled | Real-Time Alerts | 90-Day Retention)")
         print(f"Admin: admin@greenview.com / admin123")
         print(f"Landlord: landlord@greenview.com / landlord123")
         print(f"Resident: resident1@greenview.com / resident123 (RFID: ABC123456)")
