@@ -7,8 +7,8 @@ from app.main import app
 from app.core.database import Base, get_db
 from app.core.config import settings
 
-# Use a test-specific database
-TEST_DATABASE_URL = settings.async_database_url + "_test"
+# Use a test-specific database via direct connection (bypasses PgBouncer pool mapping)
+TEST_DATABASE_URL = (settings.async_direct_database_url or settings.async_database_url) + "_test"
 
 @pytest.fixture
 async def engine():
@@ -47,3 +47,18 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
     ) as client:
         yield client
     app.dependency_overrides.clear()
+
+@pytest.fixture
+async def guard_headers(db_session):
+    """Create an authenticated guard in the requested isolated test estate."""
+    import uuid
+    from app.models.user import User, UserRole
+    from app.services.auth import create_access_token, get_password_hash
+    async def create(app_id):
+        guard = User(email=uuid.uuid4().hex + "@guard.example", app_id=app_id,
+                     roles=[UserRole.SECURITY], hashed_password=get_password_hash("guard-test-password"))
+        db_session.add(guard)
+        await db_session.commit()
+        token = create_access_token({"sub": guard.email, "app_id": app_id, "roles": ["security"]})
+        return {"X-App-Id": app_id, "Authorization": "Bearer " + token}
+    return create

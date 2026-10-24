@@ -17,48 +17,23 @@ from app.core.redis import (
 )
 from app.services.access_logs import drain_access_log_queue
 from app.services.token_state import drain_token_state_queue
+from app.services.chat import drain_chat_message_queue
 
 logger = logging.getLogger(__name__)
 
 async def purge_expired_access_logs(db: AsyncSession) -> int:
-    """
-    Purges access logs that exceed each estate's subscription tier retention window
-    (30 days for Starter, 90 days for Standard, 180 days for Premium, 365 days for Enterprise).
-    """
-    total_purged = 0
-    now = datetime.now(UTC).replace(tzinfo=None)
-
-    # 1. Fetch all estates with their active subscription details
-    result = await db.execute(
-        select(Estate).options(selectinload(Estate.subscription))
-    )
-    estates = result.scalars().all()
-
-    for estate in estates:
-        if not estate.app_id:
-            continue
-
-        retention_days = 90 # fallback
-        if estate.subscription and estate.subscription.log_retention_days:
-            retention_days = estate.subscription.log_retention_days
-
-        cutoff = now - timedelta(days=retention_days)
-
-        # 2. Delete logs older than retention window for this specific tenant
-        del_stmt = (
-            delete(AccessLog)
-            .where(
-                AccessLog.app_id == estate.app_id,
-                AccessLog.created_at < cutoff
-            )
-        )
-        del_res = await db.execute(del_stmt)
-        purged_for_estate = del_res.rowcount
-        total_purged += purged_for_estate
-
-    await db.commit()
-    logger.info(f"[MAINTENANCE] Access log retention purge completed. Purged {total_purged} expired log entries.")
-    return total_purged
+    """Bounded per-estate cleanup; the read cutoff remains immediate."""
+    from app.services.history_policy import retention,delete_log_batch
+    app_ids=list((await db.execute(select(Estate.app_id))).scalars().all())
+    total=0
+    for app_id in app_ids:
+        days,_=await retention(db,app_id)
+        cutoff=datetime.now(UTC).replace(tzinfo=None)-timedelta(days=days)
+        for _ in range(10):
+            removed=await delete_log_batch(db,app_id,cutoff)
+            total+=removed
+            if removed<1000: break
+    return total
 
 async def reset_billing_cycles_and_check_expirations(db: AsyncSession) -> Dict[str, int]:
     """
@@ -102,45 +77,28 @@ async def reset_billing_cycles_and_check_expirations(db: AsyncSession) -> Dict[s
         "subscriptions_expired": subscriptions_expired
     }
 
-async def cleanup_expired_tokens(db: AsyncSession) -> Dict[str, int]:
-    """
-    1. Transitions unverified visitor entry tokens past their 24h validity window to 'expired'.
-    2. Clears expired book-out exit passcodes.
-    """
-    now = datetime.now(UTC).replace(tzinfo=None)
-
-    # 1. Expire stale pending entry tokens
-    entry_stmt = (
-        update(VisitorToken)
-        .where(
-            VisitorToken.status == "pending",
-            VisitorToken.expires_at < now
-        )
-        .values(status="expired")
-    )
-    entry_res = await db.execute(entry_stmt)
-    pending_tokens_expired = entry_res.rowcount
-
-    # 2. Clear stale book-out exit codes
-    bookout_stmt = (
-        update(VisitorToken)
-        .where(
-            VisitorToken.bookout_code.isnot(None),
-            VisitorToken.bookout_expires_at < now
-        )
-        .values(bookout_code=None, bookout_expires_at=None)
-    )
-    bookout_res = await db.execute(bookout_stmt)
-    bookout_codes_cleared = bookout_res.rowcount
-
+async def cleanup_expired_tokens(db: AsyncSession) -> Dict[str,int]:
+    """Bound updates and remove only terminal tokens outside estate retention."""
+    from app.services.history_policy import retention,BATCH_SIZE
+    now=datetime.now(UTC).replace(tzinfo=None)
+    expired_ids=select(VisitorToken.id).where(VisitorToken.status=='pending',VisitorToken.expires_at<now).order_by(VisitorToken.expires_at,VisitorToken.id).limit(BATCH_SIZE).with_for_update(skip_locked=True)
+    expired=(await db.execute(update(VisitorToken).where(VisitorToken.id.in_(expired_ids)).values(status='expired').execution_options(synchronize_session=False))).rowcount
     await db.commit()
-    logger.info(
-        f"[MAINTENANCE] Token cleanup: {pending_tokens_expired} pending tokens marked expired, {bookout_codes_cleared} stale exit codes cleared."
-    )
-    return {
-        "pending_tokens_expired": pending_tokens_expired,
-        "bookout_codes_cleared": bookout_codes_cleared
-    }
+    exit_ids=select(VisitorToken.id).where(VisitorToken.bookout_code.is_not(None),VisitorToken.bookout_expires_at<now).order_by(VisitorToken.bookout_expires_at,VisitorToken.id).limit(BATCH_SIZE).with_for_update(skip_locked=True)
+    cleared=(await db.execute(update(VisitorToken).where(VisitorToken.id.in_(exit_ids)).values(bookout_code=None,bookout_expires_at=None).execution_options(synchronize_session=False))).rowcount
+    await db.commit()
+    app_ids=list((await db.execute(select(Estate.app_id))).scalars().all())
+    purged=0
+    for app_id in app_ids:
+        days,_=await retention(db,app_id)
+        cutoff=now-timedelta(days=days)
+        terminal=select(VisitorToken.id).where(VisitorToken.app_id==app_id,
+            VisitorToken.status.in_(['expired','checked_out']),VisitorToken.expires_at<cutoff,
+            ((VisitorToken.checked_out_at.is_(None)) | (VisitorToken.checked_out_at<cutoff)))
+        terminal=terminal.order_by(VisitorToken.expires_at,VisitorToken.id).limit(BATCH_SIZE).with_for_update(skip_locked=True)
+        purged+=(await db.execute(delete(VisitorToken).where(VisitorToken.id.in_(terminal)).execution_options(synchronize_session=False))).rowcount
+        await db.commit()
+    return {'pending_tokens_expired':expired,'bookout_codes_cleared':cleared,'terminal_tokens_purged':purged}
 
 async def sync_redis_quotas_to_db(db: AsyncSession) -> int:
     """
@@ -175,6 +133,7 @@ async def run_all_maintenance_jobs(db: AsyncSession) -> Dict[str, Any]:
 
     drained_logs = await drain_access_log_queue(db)
     drained_token_states = await drain_token_state_queue(db)
+    drained_chat_messages = await drain_chat_message_queue(db)
     purged_logs = await purge_expired_access_logs(db)
     billing_stats = await reset_billing_cycles_and_check_expirations(db)
     quotas_synced = await sync_redis_quotas_to_db(db)
@@ -188,6 +147,7 @@ async def run_all_maintenance_jobs(db: AsyncSession) -> Dict[str, Any]:
         "duration_seconds": round(duration, 2),
         "access_logs_drained": drained_logs,
         "token_states_drained": drained_token_states,
+        "chat_messages_drained": drained_chat_messages,
         "access_logs_purged": purged_logs,
         "quotas_synced": quotas_synced,
         "billing_cycles_reset": billing_stats["cycles_reset"],

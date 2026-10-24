@@ -430,7 +430,8 @@ async def verify_visitor_token(
                 select(VisitorToken).where(
                     VisitorToken.code == code,
                     VisitorToken.app_id == app_id,
-                )
+                    VisitorToken.status.in_(["pending", "checked_in"]),
+                ).order_by(VisitorToken.created_at.desc(), VisitorToken.id.desc()).limit(1)
             )
             candidate = alt_res.scalar_one_or_none()
             if candidate:
@@ -551,6 +552,7 @@ async def verify_visitor_token(
                 VisitorToken.code == code,
                 VisitorToken.app_id == app_id,
                 VisitorToken.is_used == False,
+                VisitorToken.status == "pending",
                 VisitorToken.expires_at > now
             )
         )
@@ -601,7 +603,7 @@ async def verify_visitor_token(
     await record_access_event(
         db,
         app_id=app_id,
-        event_type="visitor_token_verification",
+        event_type="bookout_verification" if direction == "exit" else "visitor_token_verification",
         identifier=code,
         status="denied",
         denial_reason="Invalid, expired, or already used visitor token/book-out code",

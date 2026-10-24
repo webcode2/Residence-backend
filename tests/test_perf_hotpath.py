@@ -94,7 +94,7 @@ async def test_rfid_cache_roundtrip():
 
 
 @pytest.mark.asyncio
-async def test_verify_rfid_still_works_end_to_end(client, db_session):
+async def test_verify_rfid_still_works_end_to_end(client, db_session, guard_headers):
     estate_id = uuid.uuid4()
     app_id = f"RP-{estate_id.hex[:5].upper()}"
     estate = Estate(id=estate_id, app_id=app_id, name="Perf Estate")
@@ -118,7 +118,7 @@ async def test_verify_rfid_still_works_end_to_end(client, db_session):
     db_session.add(resident)
     await db_session.commit()
 
-    headers = {"X-App-Id": app_id}
+    headers = await guard_headers(app_id)
     response = await client.get(f"/api/v1/verify/rfid/RFID-{app_id}", headers=headers)
     assert response.status_code == 200
     assert response.json()["status"] == "authorized"
@@ -181,3 +181,100 @@ async def test_token_state_queued_then_drained(db_session):
     await db_session.refresh(token)
     assert token.status == "checked_in"
     assert token.is_used is True
+
+
+@pytest.mark.asyncio
+async def test_chat_message_queued_then_drained(db_session):
+    """Chat message enqueue prevents blocking on Postgres; drain writes to Postgres."""
+    from app.core.redis import (
+        get_redis_client,
+        CHAT_MESSAGE_QUEUE_KEY,
+        chat_message_queue_length,
+    )
+    from app.services.chat import (
+        create_thread,
+        send_message,
+        drain_chat_message_queue,
+    )
+    from app.schemas.chat import ChatThreadCreateSchema, ChatMessageCreateSchema
+    from app.models.chat import ChatMessage, ChatThread
+
+    client = get_redis_client()
+    if not client:
+        pytest.skip("Redis not available")
+
+    await client.delete(CHAT_MESSAGE_QUEUE_KEY)
+
+    estate_id = uuid.uuid4()
+    app_id = f"RP-{estate_id.hex[:5].upper()}"
+    estate = Estate(id=estate_id, app_id=app_id, name="Chat Queue Estate")
+    db_session.add(estate)
+    db_session.add(Subscription(
+        estate_id=estate_id,
+        status="active",
+        expiry_date=(datetime.now(UTC).replace(tzinfo=None) + timedelta(days=30)).date(),
+    ))
+    resident = User(
+        id=uuid.uuid4(),
+        email=f"chat-res-{app_id}@test.com",
+        hashed_password="pass",
+        roles=[UserRole.RESIDENT],
+        app_id=app_id,
+    )
+    guard = User(
+        id=uuid.uuid4(),
+        email=f"chat-guard-{app_id}@test.com",
+        hashed_password="pass",
+        roles=[UserRole.SECURITY],
+        app_id=app_id,
+    )
+    db_session.add_all([resident, guard])
+    await db_session.commit()
+
+    # Create thread
+    thread, init_msg = await create_thread(
+        db_session,
+        resident,
+        ChatThreadCreateSchema(initial_message="Hello from queue test"),
+    )
+    assert thread.id is not None
+
+    # Send message via resident (enqueued to Redis)
+    thread, msg, role = await send_message(
+        db_session,
+        resident,
+        thread.id,
+        ChatMessageCreateSchema(message="Queued message 1"),
+    )
+    assert role == "resident"
+    assert await chat_message_queue_length() >= 1
+
+    # Send message via guard (enqueued to Redis)
+    thread, guard_msg, role = await send_message(
+        db_session,
+        guard,
+        thread.id,
+        ChatMessageCreateSchema(message="Guard response from queue"),
+    )
+    assert role == "security"
+    assert await chat_message_queue_length() >= 2
+
+    # Drain queue to PostgreSQL
+    drained = await drain_chat_message_queue(db_session)
+    assert drained >= 2
+    assert await chat_message_queue_length() == 0
+
+    # Verify messages exist in database
+    from sqlalchemy import select
+    result = await db_session.execute(
+        select(ChatMessage).where(ChatMessage.thread_id == thread.id).order_by(ChatMessage.created_at)
+    )
+    db_messages = result.scalars().all()
+    assert len(db_messages) == 3
+    assert db_messages[1].message == "Queued message 1"
+    assert db_messages[2].message == "Guard response from queue"
+
+    # Verify thread state updated in Postgres
+    await db_session.refresh(thread)
+    assert thread.last_message_text == "Guard response from queue"
+    assert thread.resident_unread_count == 1

@@ -1,5 +1,5 @@
-from pydantic import BaseModel, ConfigDict, EmailStr
-from typing import Optional, List, Dict
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from typing import Optional, List, Dict, Literal
 import uuid
 from datetime import datetime, date
 from app.core.tiers import SubscriptionTier
@@ -35,12 +35,29 @@ class AdminEstateStatusUpdateSchema(BaseModel):
 
 class AdminSubscriptionOverrideSchema(BaseModel):
     tier: Optional[SubscriptionTier] = None
-    status: Optional[str] = None  # active, expired, cancelled
+    status: Optional[Literal["active", "expired", "cancelled"]] = None
     expiry_date: Optional[date] = None
-    monthly_verifications_limit: Optional[int] = None
+    monthly_verifications_limit: Optional[int] = Field(None, ge=0)
     rfid_enabled: Optional[bool] = None
     realtime_alerts_enabled: Optional[bool] = None
-    log_retention_days: Optional[int] = None
+    log_retention_days: Optional[int] = Field(None, ge=1, le=3650)
+
+class AdminSubscriptionDetailSchema(BaseModel):
+    estate_id: uuid.UUID
+    estate_name: Optional[str] = None
+    app_id: Optional[str] = None
+    status: str
+    expiry_date: date
+    tier: str
+    monthly_verifications_limit: Optional[int] = None
+    current_month_verifications: int = 0
+    rfid_enabled: bool = False
+    log_retention_days: int = 30
+    realtime_alerts_enabled: bool = False
+    price_monthly: float = 15.00
+    created_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
 
 class AdminUserDetailSchema(BaseModel):
     id: uuid.UUID
@@ -62,7 +79,7 @@ class AdminUserRevokeSchema(BaseModel):
 
 class AdminChangePasswordSchema(BaseModel):
     current_password: str
-    new_password: str
+    new_password: str = Field(..., min_length=12, max_length=72)
 
 class AdminProfileSchema(BaseModel):
     id: uuid.UUID

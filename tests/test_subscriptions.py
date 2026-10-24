@@ -99,6 +99,11 @@ async def test_verification_quota_limit_enforced(client, db_session):
     db_session.add(sub)
     await db_session.commit()
 
+    # The verification hot path uses the live Redis quota counter.
+    from app.core.redis import increment_monthly_quota_redis
+    await increment_monthly_quota_redis(app_id, 2)
+    await increment_monthly_quota_redis(app_id, 2)
+
     headers = {"X-App-Id": app_id}
     response = await client.get("/api/v1/verify/token/9999", headers=headers)
     assert response.status_code == 403

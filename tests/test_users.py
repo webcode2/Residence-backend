@@ -53,7 +53,7 @@ async def test_create_user_and_get(client, db_session, auth_headers):
     user_data = {
         "email": f"user-{uuid.uuid4().hex[:4]}@test.com",
         "password": "password123",
-        "roles": [UserRole.LANDLORD.value],
+        "roles": [UserRole.RESIDENT.value],
         "app_id": app_id,
         "house_number": "Plot 7",
         "street_name": "Oak Close"
@@ -72,8 +72,11 @@ async def test_create_user_and_get(client, db_session, auth_headers):
 @pytest.mark.asyncio
 async def test_resident_registration_with_inheritance(client, db_session, auth_headers):
     app_id = auth_headers["app_id"]
-    landlord_id = auth_headers["caretaker_id"]
-    
+    host = User(email=uuid.uuid4().hex+'@test.com', hashed_password='unused', roles=[UserRole.LANDLORD], app_id=app_id)
+    db_session.add(host)
+    await db_session.flush()
+    landlord_id = host.id
+
     # Create registration token with property details
     # Example from user: SAL25 (SAL = street, 25 = house)
     reg_code = "REGABC123"
@@ -82,7 +85,8 @@ async def test_resident_registration_with_inheritance(client, db_session, auth_h
         landlord_id=landlord_id, 
         app_id=app_id,
         house_number="25",
-        street_name="SAL"
+        street_name="SAL",
+        expires_at=datetime.now(UTC).replace(tzinfo=None)+timedelta(days=7)
     )
     db_session.add(token)
     await db_session.commit()
@@ -90,7 +94,7 @@ async def test_resident_registration_with_inheritance(client, db_session, auth_h
     # Register resident
     resident_data = {
         "email": f"res-{uuid.uuid4().hex[:4]}@test.com",
-        "password": "respassword",
+        "password": "resident-password-123",
         "roles": [UserRole.RESIDENT.value],
         "app_id": app_id
     }

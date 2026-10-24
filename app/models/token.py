@@ -1,4 +1,4 @@
-from sqlalchemy import String, DateTime, ForeignKey, Index
+from sqlalchemy import String, DateTime, ForeignKey, Index, text
 from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base, ModelMixin, TenantMixin
 from datetime import datetime
@@ -12,6 +12,8 @@ class RegistrationToken(Base, ModelMixin, TenantMixin):
     landlord_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
     house_number: Mapped[str] = mapped_column(String(20), nullable=True)
     street_name: Mapped[str] = mapped_column(String(100), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    relationship_type: Mapped[str] = mapped_column(String(20), default="family", server_default="family", nullable=False)
     is_used: Mapped[bool] = mapped_column(default=False)
     is_revoked: Mapped[bool] = mapped_column(default=False)
     
@@ -41,4 +43,10 @@ class VisitorToken(Base, ModelMixin, TenantMixin):
         Index("ix_vis_tokens_app_id_code", "app_id", "code"),
         Index("ix_vis_tokens_app_id_bookout_code", "app_id", "bookout_code"),
         Index("ix_vis_tokens_app_id_status", "app_id", "status"),
+        Index("ix_vis_tokens_live_entry", "app_id", "code", "expires_at", postgresql_where=text("status = 'pending' AND is_used = false")),
+        Index("ix_vis_tokens_live_exit", "app_id", "bookout_code", "bookout_expires_at", postgresql_where=text("status = 'checked_in'")),
+        Index("ix_vis_tokens_live_code", "app_id", "code", "created_at", "id", postgresql_where=text("status IN ('pending','checked_in')")),
+        Index("ix_vis_tokens_retention", "app_id", "status", "expires_at", "id"),
+        Index("ix_vis_tokens_expiry_cleanup", "expires_at", "id", postgresql_where=text("status = 'pending'")),
+        Index("ix_vis_tokens_bookout_cleanup", "bookout_expires_at", "id", postgresql_where=text("bookout_code IS NOT NULL")),
     )

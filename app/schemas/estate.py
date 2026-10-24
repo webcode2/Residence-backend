@@ -55,8 +55,8 @@ class EstateSettingsUpdateSchema(BaseModel):
     @field_validator("token_code_length")
     @classmethod
     def validate_code_length(cls, v: int) -> int:
-        if v not in [6, 8]:
-            raise ValueError("Token code length must be either 6 or 8 characters.")
+        if v not in [4, 5, 6]:
+            raise ValueError("Token code length must be 4, 5, or 6 characters.")
         return v
 
 class EstateSettingsResponseSchema(BaseModel):

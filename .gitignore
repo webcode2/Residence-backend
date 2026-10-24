@@ -51,6 +51,17 @@ landlords_200.csv
 generate_landlords_csv.py
 *.log
 
+# Firebase Admin SDK private key. Mount the file at runtime; do not commit it.
+*firebase-adminsdk*.json
+
 # Database
 *.db
 *.sqlite
+
+# Generated local seed credentials
+.seed-credentials.json
+.seed-credentials.tmp
+.seed-demo-credentials.json
+.seed-demo-credentials.tmp
+
+.demo-bachs-webhook-secret

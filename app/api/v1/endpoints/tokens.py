@@ -24,13 +24,11 @@ async def create_registration_token(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Generate a 9-character registration code for a resident.
-    Only Caretakers (Estate Admins) can generate these to link residents to landlords.
-    Rate limited to 40 requests per minute for Caretakers.
-    """
-    if UserRole.CARETAKER not in current_user.roles:
-        raise HTTPException(status_code=403, detail="Only admins can generate registration codes")
+    """Landlords invite a family member or tenant to their own household."""
+    if UserRole.LANDLORD not in current_user.roles:
+        raise HTTPException(status_code=403, detail="Only hosts can invite household members")
+    if token_in.landlord_id is not None and token_in.landlord_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only invite members to your own household")
 
     # Rate limiting: 40 tokens / min for Caretakers
     is_allowed, count, retry_after = await check_rate_limit(
@@ -48,10 +46,11 @@ async def create_registration_token(
         
     return await token_service.create_registration_token(
         db, 
-        landlord_id=token_in.landlord_id, 
+        landlord_id=current_user.id,
         app_id=app_id,
         house_number=token_in.house_number,
-        street_name=token_in.street_name
+        street_name=token_in.street_name,
+        relationship_type=token_in.relationship_type
     )
 
 @router.post("/registration/{code}/revoke", response_model=dict)
@@ -62,9 +61,13 @@ async def revoke_registration_token(
     current_user: User = Depends(get_current_user)
 ):
     """Revoke a registration code if it was exposed or is no longer valid."""
-    if UserRole.CARETAKER not in current_user.roles:
-        raise HTTPException(status_code=403, detail="Only admins can revoke registration codes")
-        
+    from sqlalchemy import select
+    from app.models.token import RegistrationToken
+    owned = (await db.execute(select(RegistrationToken).where(RegistrationToken.code == code,
+        RegistrationToken.app_id == app_id, RegistrationToken.landlord_id == current_user.id))).scalar_one_or_none()
+    if UserRole.CARETAKER not in current_user.roles and (UserRole.LANDLORD not in current_user.roles or not owned):
+        raise HTTPException(status_code=403, detail="You can only revoke your own household invitations")
+
     success = await token_service.revoke_registration_token(db, code, app_id)
     if not success:
         raise HTTPException(status_code=404, detail="Token not found")
@@ -134,6 +137,39 @@ async def get_active_visitors_roster(
     """
     return await token_service.get_active_visitors(db, app_id)
 
+@router.get("/visitor/history", response_model=List[VisitorTokenSchema])
+async def visitor_history(
+    app_id: str = Depends(validate_tenant),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from sqlalchemy import select
+    from app.models.token import VisitorToken
+    from app.core.redis import get_token_live_status
+    from app.services.history_policy import retention
+    from app.models.base import utc_now
+    from datetime import timedelta
+    from sqlalchemy import or_
+    days,_=await retention(db,app_id)
+    cutoff=utc_now()-timedelta(days=days)
+    query = select(VisitorToken).where(VisitorToken.app_id == app_id,or_(
+        VisitorToken.status=='checked_in',VisitorToken.expires_at>=cutoff,VisitorToken.checked_out_at>=cutoff))
+    if not {UserRole.SECURITY, UserRole.CARETAKER}.intersection(current_user.roles):
+        query = query.where(VisitorToken.resident_id == current_user.id)
+    rows = (await db.execute(query.order_by(VisitorToken.created_at.desc()).limit(200))).scalars().all()
+    result = []
+    for row in rows:
+        item = VisitorTokenSchema.model_validate(row)
+        live = await get_token_live_status(str(row.id))
+        if live:
+            item.status = live.get("status", item.status)
+            for field in ("checked_in_at", "checked_out_at"):
+                if live.get(field):
+                    from datetime import datetime
+                    setattr(item, field, datetime.fromisoformat(live[field]))
+        result.append(item)
+    return result
+
 @router.post("/visitor/{token_id}/book-out", response_model=BookOutTokenResponseSchema)
 async def generate_bookout_token(
     token_id: uuid.UUID,
@@ -142,7 +178,7 @@ async def generate_bookout_token(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Generate a 4-digit book-out code for a checked-in visitor.
+    Generate an estate-configured book-out code for a checked-in visitor.
     - Rate limits: 30 tokens/min for Residents & Landlords, 40 tokens/min for Caretakers.
     - Security guards cannot generate tokens unless they also have a resident role.
     """
@@ -199,15 +235,28 @@ async def direct_security_checkout(
     token_id: uuid.UUID,
     app_id: str = Depends(validate_tenant),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(check_roles([UserRole.SECURITY, UserRole.CARETAKER]))
+    current_user: User = Depends(check_roles([UserRole.SECURITY]))
 ):
     """
     Direct one-tap book out by security personnel at the exit gate terminal.
     Immediately marks the visitor as checked out without requiring code generation.
     """
-    return await token_service.direct_security_checkout(
+    result = await token_service.direct_security_checkout(
         db=db,
         token_id=token_id,
         app_id=app_id,
         guard_id=current_user.id
     )
+
+    from app.api.v1.endpoints.verify import _notify_visitor_access
+    await _notify_visitor_access(db, app_id, result)
+    return result
+
+@router.get('/registration', response_model=List[RegistrationTokenSchema])
+async def list_household_invitations(app_id: str = Depends(validate_tenant), db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(check_roles([UserRole.LANDLORD]))):
+    from sqlalchemy import select
+    from app.models.token import RegistrationToken
+    return (await db.execute(select(RegistrationToken).where(RegistrationToken.app_id == app_id,
+        RegistrationToken.landlord_id == current_user.id, RegistrationToken.is_revoked.is_(False))
+        .order_by(RegistrationToken.created_at.desc()).limit(100))).scalars().all()

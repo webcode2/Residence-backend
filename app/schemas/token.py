@@ -1,5 +1,5 @@
 from pydantic import BaseModel, ConfigDict
-from typing import Optional
+from typing import Optional, Literal
 import uuid
 from datetime import datetime
 
@@ -11,12 +11,15 @@ class RegistrationTokenBaseSchema(BaseModel):
     app_id: str
 
 class RegistrationTokenCreateSchema(BaseModel):
-    landlord_id: uuid.UUID
-    house_number: str
-    street_name: str
+    landlord_id: Optional[uuid.UUID] = None
+    house_number: Optional[str] = None
+    street_name: Optional[str] = None
+    relationship_type: Literal['family', 'tenant'] = 'family'
 
 class RegistrationTokenSchema(RegistrationTokenBaseSchema):
     id: uuid.UUID
+    expires_at: Optional[datetime] = None
+    relationship_type: str = "family"
     is_used: bool
     created_at: datetime
     
@@ -50,6 +53,6 @@ class BookOutTokenResponseSchema(BaseModel):
     bookout_code: str
     status: str
     expires_at: datetime
-    message: str = "Present this 4-digit code at the exit gate to book out."
+    message: str = "Present this exit code at the exit gate to book out."
 
     model_config = ConfigDict(from_attributes=True)

@@ -9,7 +9,8 @@ from app.services import admin as admin_service
 
 router = APIRouter()
 
-@router.get("/", response_model=List[AccessLogResponseSchema], tags=["saas_admin_access_logs"])
+@router.get("", response_model=List[AccessLogResponseSchema], tags=["saas_admin_access_logs"])
+@router.get("/", response_model=List[AccessLogResponseSchema], tags=["saas_admin_access_logs"], include_in_schema=False)
 async def get_global_access_logs(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),

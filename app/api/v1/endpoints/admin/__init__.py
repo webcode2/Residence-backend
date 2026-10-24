@@ -6,7 +6,10 @@ from app.api.v1.endpoints.admin.subscriptions import router as subscriptions_rou
 from app.api.v1.endpoints.admin.users import router as users_router
 from app.api.v1.endpoints.admin.access_logs import router as access_logs_router
 
+from app.api.v1.endpoints.admin.audit import router as audit_router
+
 admin_router = APIRouter()
+admin_router.include_router(audit_router, prefix="/audit")
 
 admin_router.include_router(auth_router, prefix="/auth")
 admin_router.include_router(analytics_router, prefix="/analytics")

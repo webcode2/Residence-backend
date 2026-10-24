@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from pydantic import ConfigDict, model_validator, field_validator
+from pydantic import ConfigDict, model_validator, field_validator, Field
 from typing import List, Union, Any
 import json
 
@@ -24,6 +24,7 @@ class Settings(BaseSettings):
 
     SECRET_KEY: str = "supersecretkey" # Change in production
     ALGORITHM: str = "HS256"
+    TENANT_SESSION_DAYS: int = 60
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 8  # 8 days
 
     # Isolated cryptographic secrets for SaaS Admin (Platform Owner)
@@ -49,9 +50,17 @@ class Settings(BaseSettings):
     RESEND_SENDER_EMAIL: str = "onboarding@resend.dev"
     RESEND_SENDER_NAME: str = "Residence Support"
 
+    # Firebase Cloud Messaging (HTTP v1). Leave credentials empty to simulate pushes in dev.
+    # FCM_SERVICE_ACCOUNT_JSON accepts the raw service-account JSON; FCM_SERVICE_ACCOUNT_FILE a path to it.
+    FCM_PROJECT_ID: str = ""
+    FCM_SERVICE_ACCOUNT_FILE: str = ""
+    FCM_SERVICE_ACCOUNT_JSON: str = ""
+    FCM_ANDROID_CHANNEL_ID: str = "residence_chat"
+
     # Bachs Payment Gateway Settings
     BACHS_SECRET_KEY: str = ""
     BACHS_PUBLIC_KEY: str = ""
+    ESTATE_TRIAL_DAYS: int = Field(default=14, ge=1, le=365)
     BACHS_WEBHOOK_SECRET: str = ""
     BACHS_BASE_URL: str = "https://api.bachs.io"
 
@@ -62,6 +71,8 @@ class Settings(BaseSettings):
     ACCESS_LOG_DRAIN_BATCH_SIZE: int = 500
     TOKEN_STATE_DRAIN_INTERVAL_SECONDS: float = 2.0
     TOKEN_STATE_DRAIN_BATCH_SIZE: int = 500
+    CHAT_MESSAGE_DRAIN_INTERVAL_SECONDS: float = 2.0
+    CHAT_MESSAGE_DRAIN_BATCH_SIZE: int = 500
 
     @field_validator("ENABLE_MAINTENANCE_SCHEDULER", mode="before")
     @classmethod

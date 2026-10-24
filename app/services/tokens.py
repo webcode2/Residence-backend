@@ -24,21 +24,27 @@ import string
 import uuid
 
 def generate_registration_code() -> str:
-    # 9-char alphanumeric code (e.g. REG4N8P3Q)
-    suffix = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
-    return f"REG{suffix}"
+    return generate_visitor_code(9)
 
-VISITOR_TOKEN_CHARSET = string.ascii_uppercase  # A-Z uppercase letters
+VISITOR_TOKEN_CHARSET = string.ascii_uppercase + string.digits
 
 def generate_visitor_code(length: int = 6) -> str:
-    """Generates an uppercase A-Z code of specified length (default 6, or 8)."""
-    return ''.join(secrets.choice(VISITOR_TOKEN_CHARSET) for _ in range(length))
+    """Use one letter and the remaining characters as digits, securely shuffled."""
+    if length < 2:
+        raise ValueError("Alphanumeric codes require at least two characters")
+    characters = [secrets.choice(string.ascii_uppercase)]
+    characters.extend(secrets.choice(string.digits) for _ in range(length - 1))
+    # Fisher-Yates with a cryptographically secure source.
+    for i in range(len(characters) - 1, 0, -1):
+        j = secrets.randbelow(i + 1)
+        characters[i], characters[j] = characters[j], characters[i]
+    return ''.join(characters)
 
 async def get_estate_token_code_length(db: AsyncSession, app_id: str) -> int:
     """Fetch the configured token code length for the estate (default: 6, or 8)."""
     result = await db.execute(select(Estate.token_code_length).where(Estate.app_id == app_id))
     length = result.scalar_one_or_none()
-    return length if length in [6, 8] else 6
+    return length if length in [4, 5, 6, 8] else 6
 
 async def is_visitor_code_active(db: AsyncSession, app_id: str, candidate_code: str) -> bool:
     """
@@ -83,7 +89,7 @@ async def generate_unique_visitor_code(
     max_retries: int = 30
 ) -> str:
     """
-    Generates an uppercase A-Z code (default 6 characters, or 8 if configured on dashboard)
+    Generates a code with one letter and remaining digits at the estate-configured length
     guaranteed to be unique across both active entry and active exit codes in the estate.
     """
     if length is None:
@@ -91,12 +97,6 @@ async def generate_unique_visitor_code(
 
     for _ in range(max_retries):
         candidate = generate_visitor_code(length=length)
-        if not await is_visitor_code_active(db, app_id, candidate):
-            return candidate
-
-    # High-density fallback: add 1 char
-    for _ in range(10):
-        candidate = generate_visitor_code(length=length + 1)
         if not await is_visitor_code_active(db, app_id, candidate):
             return candidate
 
@@ -161,15 +161,23 @@ async def create_registration_token(
     landlord_id: uuid.UUID, 
     app_id: str, 
     house_number: str = None, 
-    street_name: str = None
+    street_name: str = None,
+    relationship_type: str = "family"
 ) -> RegistrationToken:
     await _validate_subscription_for_tokens(db, app_id, is_visitor_token=False)
 
+    from app.models.user import UserRole
+    host = (await db.execute(select(User).where(User.id == landlord_id, User.app_id == app_id,
+        User.is_revoked.is_(False)))).scalar_one_or_none()
+    if not host or UserRole.LANDLORD not in host.roles or host.must_change_password:
+        raise HTTPException(403, "An active onboarded landlord is required")
     db_obj = RegistrationToken(
         code=generate_registration_code(),
         landlord_id=landlord_id,
-        house_number=house_number,
-        street_name=street_name,
+        house_number=host.house_number,
+        street_name=host.street_name,
+        relationship_type=relationship_type,
+        expires_at=datetime.now(UTC).replace(tzinfo=None) + timedelta(days=7),
         app_id=app_id
     )
     db.add(db_obj)
@@ -290,7 +298,7 @@ async def create_bookout_token(
             detail="Visitor has already checked out of the estate"
         )
 
-    # Generate fresh 4-digit exit code with 2 hours validity, guaranteed unique across entry & exit
+    # Generate fresh estate-configured exit code with 2 hours validity, guaranteed unique across entry & exit
     bookout_code = await generate_unique_visitor_code(db, app_id)
     expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=2)
 
@@ -321,7 +329,7 @@ async def create_bookout_token(
         "bookout_code": bookout_code,
         "status": effective_status,
         "expires_at": expires_at,
-        "message": "Present this 4-digit code at the exit gate to book out."
+        "message": "Present this exit code at the exit gate to book out."
     }
 
 async def direct_security_checkout(
@@ -414,17 +422,20 @@ async def direct_security_checkout(
         "message": f"Visitor {token.visitor_name} successfully booked out by security"
     }
 
-async def get_active_visitors(db: AsyncSession, app_id: str) -> list[VisitorToken]:
-    """
-    Returns all visitors currently inside the estate (status == 'checked_in').
-    Empowers security personnel with a real-time on-premises visitor roster.
-    """
-    result = await db.execute(
-        select(VisitorToken)
-        .where(
-            VisitorToken.app_id == app_id,
-            VisitorToken.status == "checked_in"
-        )
-        .order_by(VisitorToken.checked_in_at.desc())
-    )
-    return list(result.scalars().all())
+async def get_active_visitors(db: AsyncSession, app_id: str) -> list:
+    """Overlay queued gate state so arrivals/departures show before DB drain."""
+    from app.schemas.token import VisitorTokenSchema
+    rows = (await db.execute(select(VisitorToken).where(
+        VisitorToken.app_id == app_id, VisitorToken.status != "checked_out",
+    ).order_by(VisitorToken.checked_in_at.desc()))).scalars().all()
+    active = []
+    for row in rows:
+        item = VisitorTokenSchema.model_validate(row)
+        live = await get_token_live_status(str(row.id))
+        if live:
+            item.status = live.get('status', item.status)
+            if live.get('checked_in_at'):
+                item.checked_in_at = datetime.fromisoformat(live['checked_in_at'])
+        if item.status == 'checked_in':
+            active.append(item)
+    return active

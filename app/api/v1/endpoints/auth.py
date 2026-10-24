@@ -2,11 +2,18 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.services import auth as auth_service
-from app.schemas.user import TokenSchema, LoginRequestSchema, AuthResponseSchema
+from app.schemas.user import ChangePasswordSchema, TokenSchema, LoginRequestSchema, AuthResponseSchema
 from app.models.user import User
-from app.dependencies import validate_tenant, ValidateTenant, oauth2_scheme, get_current_user
+from app.dependencies import validate_tenant, ValidateTenant, oauth2_scheme, get_current_user, get_authenticated_user
 from app.core.redis import check_login_blocked, record_login_failure, reset_login_failures
 import uuid
+from datetime import timedelta, datetime, UTC
+from app.core.config import settings
+
+def _remaining_token_seconds(token: str) -> int:
+    from jose import jwt
+    claims = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    return max(1, int(claims["exp"] - datetime.now(UTC).timestamp()) + 1)
 
 router = APIRouter()
 
@@ -62,17 +69,18 @@ async def login_for_access_token(
         )
 
     access_token = auth_service.create_access_token(
-        data={"sub": user.email, "app_id": app_id, "roles": [role.value for role in user.roles]}
+        data={"sub": user.email, "uid": str(user.id), "app_id": app_id, "roles": [role.value for role in user.roles], "purpose": "password_change" if user.must_change_password else "access", "jti": str(uuid.uuid4())},
+        expires_delta=timedelta(minutes=30) if user.must_change_password else timedelta(days=settings.TENANT_SESSION_DAYS)
     )
 
     # Pre-warm user profile in Redis so the user's first authenticated request is an instant cache hit
     from app.core.redis import set_cached_user
-    from app.core.config import settings
     await set_cached_user(
         app_id=app_id,
         email=user.email,
         user_data={
             "id": str(user.id),
+            "created_at": user.created_at.isoformat(),
             "email": user.email,
             "full_name": user.full_name,
             "hashed_password": user.hashed_password,
@@ -81,15 +89,23 @@ async def login_for_access_token(
             "house_number": user.house_number,
             "street_name": user.street_name,
             "is_revoked": user.is_revoked,
+            "must_change_password": user.must_change_password,
             "app_id": user.app_id,
             "landlord_id": str(user.landlord_id) if user.landlord_id else None
         },
-        ttl_seconds=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        ttl_seconds=1800
     )
+
+    # Include estate code length for the mobile settings cache and guard input.
+    from app.models.estate import Estate
+    from sqlalchemy import select as sa_select
+    estate_result = await db.execute(sa_select(Estate.token_code_length).where(Estate.app_id == app_id))
+    token_code_length = estate_result.scalar_one_or_none() or 6
 
     return {
         "token": {"access_token": access_token, "token_type": "bearer"},
-        "user": user
+        "user": user,
+        "token_code_length": token_code_length,
     }
 
 @router.post("/logout", tags=["auth"])
@@ -101,10 +117,37 @@ async def logout(
     Logout user, blacklist active JWT in Redis, and clear user session cache.
     """
     from app.core.redis import blacklist_token, invalidate_cached_user
-    from app.core.config import settings
 
-    await blacklist_token(token, ttl_seconds=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60)
+    await blacklist_token(token, ttl_seconds=_remaining_token_seconds(token))
     await invalidate_cached_user(current_user.app_id, current_user.email)
     return {"status": "success", "message": "Successfully logged out and token invalidated"}
 
 
+
+@router.post("/change-password", response_model=AuthResponseSchema)
+async def change_password(
+    body: ChangePasswordSchema,
+    token: str = Depends(oauth2_scheme),
+    current_user: User = Depends(get_authenticated_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.core.redis import invalidate_cached_user, blacklist_token
+    user = await db.get(User, current_user.id, populate_existing=True)
+    if not user or not auth_service.verify_password(body.current_password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if len(body.new_password) < 12 or len(body.new_password.encode('utf-8')) > 72:
+        raise HTTPException(status_code=422, detail="Use at least 12 characters and no more than 72 UTF-8 bytes")
+    if auth_service.verify_password(body.new_password, user.hashed_password):
+        raise HTTPException(status_code=422, detail="Choose a different password")
+    user.hashed_password = auth_service.get_password_hash(body.new_password)
+    user.must_change_password = False
+    await db.commit()
+    await db.refresh(user)
+    await invalidate_cached_user(user.app_id, user.email)
+    await blacklist_token(token, ttl_seconds=_remaining_token_seconds(token))
+    fresh = auth_service.create_access_token({"sub": user.email, "uid": str(user.id), "app_id": user.app_id,
+        "roles": [r.value for r in user.roles], "purpose": "access", "jti": str(uuid.uuid4())}, expires_delta=timedelta(days=settings.TENANT_SESSION_DAYS))
+    from app.models.estate import Estate
+    from sqlalchemy import select
+    length = (await db.execute(select(Estate.token_code_length).where(Estate.app_id == user.app_id))).scalar_one_or_none() or 6
+    return {"token": {"access_token": fresh, "token_type": "bearer"}, "user": user, "token_code_length": length}

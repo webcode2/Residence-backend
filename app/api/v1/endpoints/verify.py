@@ -3,7 +3,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 from app.core.database import get_db
 from app.services import verification as verify_service
-from app.dependencies import validate_tenant
+from app.dependencies import validate_tenant, check_roles
+from app.models.user import UserRole
 from app.core.redis import (
     check_verification_blocked,
     record_verification_failure,
@@ -13,16 +14,14 @@ from app.core.redis import (
 router = APIRouter()
 
 def _get_client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 @router.get("/rfid/{rfid_tag}", tags=["profiling"])
 async def verify_rfid(
     rfid_tag: str,
     app_id: str = Depends(validate_tenant),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(check_roles([UserRole.SECURITY]))
 ):
     result = await verify_service.verify_rfid_access(db, rfid_tag, app_id)
     if not result:
@@ -30,6 +29,7 @@ async def verify_rfid(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Access Denied: Invalid tag or revoked user/landlord"
         )
+    await _notify_visitor_access(db, app_id, result)
     return result
 
 @router.get("/token/{code}", tags=["profiling"])
@@ -38,7 +38,8 @@ async def verify_token(
     request: Request,
     direction: Optional[str] = Query(None, description="Optional lane direction: 'entry', 'exit', or auto-detect if omitted"),
     app_id: str = Depends(validate_tenant),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(check_roles([UserRole.SECURITY]))
 ):
     """
     Universal Verification Endpoint for physical gate security.
@@ -77,6 +78,7 @@ async def verify_token(
 
     # 3. Successful verification: Reset failure counter
     await reset_verification_failures(app_id, client_ip)
+    await _notify_visitor_access(db, app_id, result)
     return result
 
 @router.get("/book-out/{code}", tags=["profiling"])
@@ -84,7 +86,8 @@ async def verify_bookout(
     code: str,
     request: Request,
     app_id: str = Depends(validate_tenant),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(check_roles([UserRole.SECURITY]))
 ):
     """
     Dedicated exit barrier verification endpoint (or security personnel can 
@@ -118,4 +121,32 @@ async def verify_bookout(
         )
 
     await reset_verification_failures(app_id, client_ip)
+    await _notify_visitor_access(db, app_id, result)
     return result
+
+
+async def _notify_visitor_access(db, app_id, result):
+    """Dispatch a push after successful verification; no client polling needed."""
+    import asyncio
+    import uuid
+    from sqlalchemy import select
+    from app.models.user import User
+    from app.services.fcm import fcm_service
+    if result.get('action') not in ('check_in', 'book_out') or not result.get('resident_id'):
+        return
+    resident = (await db.execute(select(User).where(
+        User.id == uuid.UUID(str(result['resident_id'])), User.app_id == app_id,
+        User.is_revoked.is_(False),
+    ))).scalar_one_or_none()
+    if resident:
+        from app.services.notification_inbox import record, unread_count
+        notification_id=str(uuid.uuid4())
+        await record(db,resident.id,app_id,'access:'+notification_id,'Visitor departure' if result['action']=='book_out' else 'Visitor arrival',result.get('message','Visitor access updated'),{'type':'visitor_access','action':result['action'],'app_id':app_id})
+        await db.commit()
+    if resident and resident.fcm_token:
+        asyncio.create_task(fcm_service.send_to_token(
+            resident.fcm_token,
+            'Visitor departure' if result['action'] == 'book_out' else 'Visitor arrival',
+            result.get('message', 'Visitor access updated'),
+            data={'type': 'visitor_access', 'action': result['action'], 'app_id': app_id, 'notification_count': await unread_count(db,resident.id,app_id)},
+        ))

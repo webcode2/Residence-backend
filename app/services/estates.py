@@ -1,3 +1,4 @@
+from app.services.plans import get_plan
 from typing import Optional, List, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -32,7 +33,7 @@ async def create_estate(db: AsyncSession, estate_in: EstateCreateSchema) -> Esta
     db.add(new_estate)
     await db.flush()
     
-    tier_cfg = get_tier_config(estate_in.tier or SubscriptionTier.STARTER)
+    tier_cfg = await get_plan(db, estate_in.tier or SubscriptionTier.STARTER)
     new_subscription = Subscription(
         estate_id=new_estate.id,
         status="active",
@@ -71,11 +72,11 @@ async def register_new_estate(db: AsyncSession, reg_in: EstateRegistrationReques
     await db.flush()
     
     # 3. Create Subscription with selected tier
-    tier_cfg = get_tier_config(reg_in.tier or SubscriptionTier.STARTER)
+    tier_cfg = await get_plan(db, reg_in.tier or SubscriptionTier.STARTER)
     new_subscription = Subscription(
         estate_id=new_estate.id,
-        status="active",
-        expiry_date=(datetime.now(UTC).replace(tzinfo=None) + timedelta(days=365)).date(),
+        status="pending_activation",
+        expiry_date=datetime.now(UTC).date(),
         tier=tier_cfg["tier"],
         monthly_verifications_limit=tier_cfg["monthly_verifications_limit"],
         current_month_verifications=0,
@@ -122,7 +123,7 @@ async def change_estate_tier(db: AsyncSession, app_id: str, new_tier: Subscripti
     if not estate or not estate.subscription:
         raise HTTPException(status_code=404, detail="Estate or subscription not found")
 
-    tier_cfg = get_tier_config(new_tier)
+    tier_cfg = await get_plan(db, new_tier)
     sub = estate.subscription
     sub.tier = tier_cfg["tier"]
     sub.monthly_verifications_limit = tier_cfg["monthly_verifications_limit"]
@@ -163,9 +164,9 @@ async def get_estate_settings(db: AsyncSession, app_id: str) -> dict:
     }
 
 async def update_estate_settings(db: AsyncSession, app_id: str, token_code_length: int) -> dict:
-    """Update estate dashboard settings such as token code length (6 or 8)."""
-    if token_code_length not in [6, 8]:
-        raise HTTPException(status_code=400, detail="Token code length must be either 6 or 8 characters.")
+    """Update estate dashboard settings such as token code length (4, 5, or 6)."""
+    if token_code_length not in [4, 5, 6]:
+        raise HTTPException(status_code=400, detail="Token code length must be 4, 5, or 6 characters.")
 
     result = await db.execute(
         select(Estate).where(Estate.app_id == app_id).options(selectinload(Estate.subscription))
@@ -177,6 +178,7 @@ async def update_estate_settings(db: AsyncSession, app_id: str, token_code_lengt
     estate.token_code_length = token_code_length
     await db.commit()
     await db.refresh(estate)
+    await db.refresh(estate, attribute_names=["subscription"])
 
     # Invalidate cached subscription & tenant state in Redis
     await invalidate_subscription_cache(app_id)

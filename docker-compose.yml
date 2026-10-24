@@ -53,6 +53,10 @@ services:
     build: .
     container_name: residence_backend
     restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./residence-336b6-firebase-adminsdk-fbsvc-6ef51abbb7.json:/app/residence-336b6-firebase-adminsdk-fbsvc-6ef51abbb7.json:ro
     ports:
       - "8000:8000"
     environment:

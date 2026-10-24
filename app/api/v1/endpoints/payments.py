@@ -79,7 +79,12 @@ async def bachs_webhook(
     Verifies HMAC-SHA256 signature and activates or extends the estate subscription.
     """
     raw_body = await request.body()
-    if not payment_service.verify_webhook_signature(raw_body, x_bachs_signature):
+    if not payment_service.verify_webhook_signature(
+        raw_body,
+        x_bachs_signature,
+        request.headers.get("x-bachs-timestamp"),
+        request.headers.get("x-bachs-signature-v2"),
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid BACHS webhook signature"

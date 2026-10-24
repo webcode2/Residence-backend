@@ -25,11 +25,12 @@ async def _usage_count(app_id: str, db_count: int) -> int:
     return redis_count if redis_count is not None else db_count
 
 @router.get("/tiers", response_model=List[TierInfoSchema])
-async def list_available_tiers():
+async def list_available_tiers(db: AsyncSession = Depends(get_db)):
     """
     List all available subscription plans, pricing, quotas, and feature entitlements.
     """
-    return [TierInfoSchema(**details) for details in TIER_DETAILS.values()]
+    from app.services.plans import list_plans
+    return await list_plans(db)
 
 @router.get("/current", response_model=SubscriptionDetailSchema)
 async def get_current_subscription(
@@ -74,31 +75,8 @@ async def change_subscription_tier(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(check_roles([UserRole.CARETAKER]))
 ):
-    """
-    Upgrade or switch the current estate's subscription tier.
-    Only accessible by Caretakers (Estate Admins).
-    """
-    sub = await estate_service.change_estate_tier(db, app_id, req.tier)
-    used = await _usage_count(app_id, sub.current_month_verifications)
-    remaining = None
-    if sub.monthly_verifications_limit is not None:
-        remaining = max(0, sub.monthly_verifications_limit - used)
-
-    return SubscriptionDetailSchema(
-        id=sub.id,
-        estate_id=sub.estate_id,
-        status=sub.status,
-        expiry_date=sub.expiry_date,
-        tier=sub.tier,
-        monthly_verifications_limit=sub.monthly_verifications_limit,
-        current_month_verifications=used,
-        verifications_remaining=remaining,
-        billing_cycle_start=sub.billing_cycle_start,
-        rfid_enabled=sub.rfid_enabled,
-        log_retention_days=sub.log_retention_days,
-        realtime_alerts_enabled=sub.realtime_alerts_enabled,
-        price_monthly=float(sub.price_monthly)
-    )
+    """Plan changes require confirmed payment or a platform-owner override."""
+    raise HTTPException(status_code=403, detail="Use checkout to change plans, or contact the platform owner for an adjustment.")
 
 @router.post("/checkout", response_model=CheckoutSessionResponseSchema)
 async def create_bachs_checkout(
@@ -168,7 +146,12 @@ async def bachs_subscription_webhook(
     """
     from app.services.payments import payment_service
     raw_body = await request.body()
-    if not payment_service.verify_webhook_signature(raw_body, x_bachs_signature):
+    if not payment_service.verify_webhook_signature(
+        raw_body,
+        x_bachs_signature,
+        request.headers.get("x-bachs-timestamp"),
+        request.headers.get("x-bachs-signature-v2"),
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid BACHS webhook signature"
@@ -176,3 +159,38 @@ async def bachs_subscription_webhook(
     payload = await request.json()
     return await payment_service.handle_webhook(db, payload)
 
+
+# Card activation is separate from one-time estate subscription purchases.
+from pydantic import BaseModel, Field
+from typing import Literal
+
+class CardActivationRequest(BaseModel):
+    tier: SubscriptionTier = SubscriptionTier.STARTER
+    expected_price_monthly: float = Field(gt=0)
+    consent: Literal[True]
+    success_url: Optional[str] = None
+    cancel_url: Optional[str] = None
+
+@router.get('/activation')
+async def card_activation_status(app_id: str = Depends(validate_tenant), db: AsyncSession = Depends(get_db),
+                                 user: User = Depends(check_roles([UserRole.CARETAKER]))):
+    from app.services import card_trials
+    return await card_trials.status(db, app_id)
+
+@router.post('/activation')
+async def activate_with_card(request: CardActivationRequest, app_id: str = Depends(validate_tenant),
+                             db: AsyncSession = Depends(get_db), user: User = Depends(check_roles([UserRole.CARETAKER]))):
+    from app.services import card_trials
+    return await card_trials.start(db, app_id, user, request)
+
+@router.post('/activation/confirm')
+async def confirm_card_activation(app_id: str = Depends(validate_tenant), db: AsyncSession = Depends(get_db),
+                                  user: User = Depends(check_roles([UserRole.CARETAKER]))):
+    from app.services import card_trials
+    return await card_trials.confirm(db, app_id)
+
+@router.post('/activation/cancel')
+async def cancel_card_renewal(app_id: str = Depends(validate_tenant), db: AsyncSession = Depends(get_db),
+                             user: User = Depends(check_roles([UserRole.CARETAKER]))):
+    from app.services import card_trials
+    return await card_trials.cancel(db, app_id)

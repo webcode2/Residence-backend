@@ -25,7 +25,7 @@ class Subscription(Base, ModelMixin):
 
     # Tier details & feature flags (defaults to Standard with RFID enabled)
     tier: Mapped[str] = mapped_column(String(50), default="standard", nullable=False)
-    monthly_verifications_limit: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=50000)
+    monthly_verifications_limit: Mapped[Optional[int]] = mapped_column(Integer().evaluates_none(), nullable=True, default=50000)
     current_month_verifications: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     billing_cycle_start: Mapped[date] = mapped_column(Date, default=date.today, nullable=False)
     rfid_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

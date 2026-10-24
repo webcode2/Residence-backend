@@ -68,6 +68,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    volumes:
+      - ./residence-336b6-firebase-adminsdk-fbsvc-6ef51abbb7.json:/app/residence-336b6-firebase-adminsdk-fbsvc-6ef51abbb7.json:ro
     environment:
       - ENVIRONMENT=production
       - DB_USE_PGBOUNCER=true
@@ -100,6 +102,8 @@ services:
     command: [ "python", "worker.py", "--daemon" ]
     env_file:
       - .env
+    volumes:
+      - ./residence-336b6-firebase-adminsdk-fbsvc-6ef51abbb7.json:/app/residence-336b6-firebase-adminsdk-fbsvc-6ef51abbb7.json:ro
     environment:
       - ENVIRONMENT=production
       - DB_USE_PGBOUNCER=true

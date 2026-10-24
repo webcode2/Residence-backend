@@ -4,7 +4,7 @@ import hmac
 import hashlib
 import json
 from datetime import datetime, timedelta, date, UTC
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, MagicMock
 
 from app.models.estate import Estate, Subscription
 from app.models.user import User, UserRole
@@ -13,7 +13,9 @@ from app.core.tiers import SubscriptionTier
 from app.core.config import settings
 
 @pytest.mark.asyncio
-async def test_bachs_checkout_and_webhook_flow(client, db_session):
+async def test_bachs_checkout_and_webhook_flow(client, db_session, monkeypatch):
+    monkeypatch.setattr(settings,'BACHS_SECRET_KEY','')
+    monkeypatch.setattr(settings,'ENVIRONMENT','development')
     # 1. Setup Estate and Caretaker (Estate Admin)
     estate_id = uuid.uuid4()
     app_id = f"RP-{estate_id.hex[:5].upper()}"
@@ -98,29 +100,19 @@ async def test_bachs_checkout_and_webhook_flow(client, db_session):
     sub_resp = await client.get("/api/v1/subscriptions/current", headers=admin_headers)
     assert sub_resp.status_code == 200
     current_sub = sub_resp.json()
-    assert current_sub["tier"] == "starter" or current_sub["tier"] == "premium"
+    assert current_sub["tier"] == "premium"
 
     # 5. Live Bachs Checkout Mock Test
-    mock_post_resp = AsyncMock()
-    mock_post_resp.status_code = 200
-    mock_post_resp.json.return_value = {
-        "id": "cs_live_998877",
-        "checkout_url": "https://checkout.bachs.io/cs_live_998877",
-        "status": "open"
-    }
-    mock_post_resp.raise_for_status = AsyncMock()
-
-    with patch("app.core.config.settings.BACHS_SECRET_KEY", "sk_test_bachs_secret"):
-        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_http_post:
-            mock_http_post.return_value = mock_post_resp
-            live_resp = await client.post(
-                "/api/v1/payments/checkout",
-                json={"tier": "enterprise"},
-                headers=admin_headers
-            )
-            assert live_resp.status_code == 200
-            assert live_resp.json()["session_id"] == "cs_live_998877"
-            assert live_resp.json()["amount"] == 100.00
+    mock_post_resp = MagicMock()
+    mock_post_resp.json.return_value = {"id":"cs_live_998877", "checkout_url":"https://checkout.bachs.io/cs_live_998877", "status":"open"}
+    provider = AsyncMock()
+    provider.post.return_value = mock_post_resp
+    with patch("app.core.config.settings.BACHS_SECRET_KEY", "sk_test_bachs_secret"), patch("app.services.payments.httpx.AsyncClient") as factory:
+        factory.return_value.__aenter__.return_value = provider
+        live_resp = await client.post("/api/v1/payments/checkout",json={"tier":"enterprise"},headers=admin_headers)
+        assert live_resp.status_code == 200,live_resp.text
+        assert live_resp.json()["session_id"] == "cs_live_998877"
+        assert live_resp.json()["amount"] == 100.00
 
     # 6. Bachs Webhook: Signature verification and fulfillment to Enterprise
     webhook_secret = "test_webhook_signing_secret"
@@ -130,6 +122,8 @@ async def test_bachs_checkout_and_webhook_flow(client, db_session):
             "data": {
                 "id": "cs_live_998877",
                 "status": "paid",
+                "amount": "100.00",
+                "currency": "USD",
                 "metadata": {
                     "app_id": app_id,
                     "tier": "enterprise",
@@ -149,11 +143,12 @@ async def test_bachs_checkout_and_webhook_flow(client, db_session):
         assert invalid_resp.status_code == 400
 
         # 6b. Valid signature succeeds and upgrades subscription
-        valid_resp = await client.post(
-            "/api/v1/subscriptions/webhook/bachs",
-            content=body_bytes,
-            headers={"Content-Type": "application/json", "X-Bachs-Signature": valid_sig}
-        )
+        paid_response=MagicMock()
+        paid_response.json.return_value={'checkout_id':'cs_live_998877','status':'completed','payment_status':'succeeded','amount':'100.00','currency':'USD'}
+        provider.get.return_value=paid_response
+        with patch('app.services.payments.httpx.AsyncClient') as factory:
+            factory.return_value.__aenter__.return_value=provider
+            valid_resp = await client.post('/api/v1/subscriptions/webhook/bachs',content=body_bytes,headers={'Content-Type':'application/json','X-Bachs-Signature':valid_sig})
         assert valid_resp.status_code == 200
         assert valid_resp.json()["status"] == "success"
         assert valid_resp.json()["tier"] == "enterprise"

@@ -4,13 +4,13 @@ from app.services.notifications import ResendClient
 from app.core.config import settings
 
 @pytest.mark.asyncio
-async def test_resend_simulation_when_no_api_key():
+async def test_registration_email_fails_when_no_api_key():
     client = ResendClient()
     client.api_key = ""
 
-    # Should simulate and return True without making network calls
+    # Welcome emails must not pretend delivery without credentials
     reg_result = await client.send_registration_email("resident@example.com", "temp_pass_123")
-    assert reg_result is True
+    assert reg_result is False
 
     alert_result = await client.send_realtime_access_alert(
         "resident@example.com", 

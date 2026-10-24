@@ -23,6 +23,7 @@ def get_password_hash(password):
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
+    to_encode.setdefault("iat", datetime.now(UTC).timestamp())
     if expires_delta:
         expire = datetime.now(UTC).replace(tzinfo=None) + expires_delta
     else:
@@ -76,3 +77,16 @@ async def authenticate_user(db: AsyncSession, email: str, password: str, app_id:
         return None
     return user
 
+
+
+def token_matches_user(payload: dict, user: User) -> bool:
+    """Bind sessions to immutable identity; reject unsafe legacy email-only tokens."""
+    if payload.get("uid") is not None:
+        return str(user.id) == payload["uid"]
+    try:
+        created = user.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        return created.timestamp() <= float(payload["iat"])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False

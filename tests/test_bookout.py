@@ -7,7 +7,7 @@ from app.models.token import VisitorToken
 from app.services.auth import create_access_token
 
 @pytest.mark.asyncio
-async def test_full_visitor_lifecycle_and_bookout(client, db_session):
+async def test_full_visitor_lifecycle_and_bookout(client, db_session, guard_headers):
     # 1. Setup Estate and Resident
     estate_id = uuid.uuid4()
     app_id = f"RP-{estate_id.hex[:5].upper()}"
@@ -52,7 +52,7 @@ async def test_full_visitor_lifecycle_and_bookout(client, db_session):
     assert "not checked in" in resp_premature.json()["detail"].lower()
 
     # 3. Visitor arrives at ENTRY gate (GET /api/v1/verify/token/{code})
-    gate_headers = {"X-App-Id": app_id}
+    gate_headers = await guard_headers(app_id)
     resp_entry = await client.get(f"/api/v1/verify/token/{entry_code}", headers=gate_headers)
     assert resp_entry.status_code == 200
     assert resp_entry.json()["status"] == "authorized"
@@ -96,7 +96,7 @@ async def test_full_visitor_lifecycle_and_bookout(client, db_session):
 
 
 @pytest.mark.asyncio
-async def test_security_operations_workflow(client, db_session):
+async def test_security_operations_workflow(client, db_session, guard_headers):
     """
     Test that security personnel (UserRole.SECURITY) can execute the full operation:
     1. View active visitor roster (GET /tokens/visitor/active)
@@ -139,7 +139,7 @@ async def test_security_operations_workflow(client, db_session):
 
     sec_token = create_access_token(data={"sub": security_user.email, "app_id": app_id, "roles": ["security"]})
     sec_headers = {"Authorization": f"Bearer {sec_token}", "X-App-Id": app_id}
-    gate_headers = {"X-App-Id": app_id}
+    gate_headers = await guard_headers(app_id)
 
     # Create a visitor checked in
     v_token = VisitorToken(
@@ -163,10 +163,9 @@ async def test_security_operations_workflow(client, db_session):
     assert len(active_list) == 1
     assert active_list[0]["visitor_name"] == "Guest Alpha"
 
-    # 2. Security generates bookout code from their gate terminal for this visitor
+    # 2. A guard without a resident role cannot generate host exit codes
     bookout_resp = await client.post(f"/api/v1/tokens/visitor/{v_token.id}/book-out", headers=sec_headers)
-    assert bookout_resp.status_code == 200
-    assert "bookout_code" in bookout_resp.json()
+    assert bookout_resp.status_code == 403
 
     # 3. Security performs direct one-tap checkout at the exit gate
     checkout_resp = await client.post(f"/api/v1/tokens/visitor/{v_token.id}/checkout", headers=sec_headers)

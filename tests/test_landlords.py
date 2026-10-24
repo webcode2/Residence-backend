@@ -40,13 +40,13 @@ async def test_import_landlords_success(client, db_session):
         import_data = [
             {
                 "email": f"landlord1-{uuid.uuid4().hex[:4]}@test.com", 
-                "name": "Landlord 1",
+                "name": "Landlord 1", "phone": "+2348012345678",
                 "house_number": "12", 
                 "street_name": "Eborn"
             },
             {
                 "email": f"landlord2-{uuid.uuid4().hex[:4]}@test.com", 
-                "name": "Landlord 2",
+                "name": "Landlord 2", "phone": "+2348012345679",
                 "house_number": "25", 
                 "street_name": "SAL"
             }
@@ -56,19 +56,14 @@ async def test_import_landlords_success(client, db_session):
         
         assert response.status_code == 200
         assert len(response.json()) == 2
-        assert response.json()[0]["status"] == "success"
+        assert response.json()[0]["status"] == "queued"
         
-        # Verify users created in DB with property details
+        # Queueing must return before account creation or email delivery.
         from sqlalchemy import select
-        result = await db_session.execute(select(User).where(User.email == import_data[0]["email"]))
-        user1 = result.scalar_one_or_none()
-        assert user1 is not None
-        assert user1.house_number == "12"
-        assert user1.street_name == "Eborn"
-        assert UserRole.LANDLORD in user1.roles
-        
-        # Verify email was "sent"
-        assert mock_send.call_count == 2
+        from app.models.onboarding import LandlordOnboardingJob
+        jobs=(await db_session.execute(select(LandlordOnboardingJob))).scalars().all()
+        assert len(jobs)==2 and jobs[0].status=='queued'
+        assert mock_send.call_count==0
 
 @pytest.mark.asyncio
 async def test_import_landlords_bulk_200(client, db_session):
@@ -92,12 +87,9 @@ async def test_import_landlords_bulk_200(client, db_session):
     db_session.add(caretaker)
     await db_session.commit()
 
-    # Read from the CSV file created earlier
-    import_data = []
-    with open("landlords_200.csv", mode='r') as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            import_data.append(row)
+    # Generate a batch without relying on a missing external fixture file.
+    import_data = [dict(name=f"Landlord {i}", email=f"landlord{i}@bulktest.com",
+        phone="+2348012345678", house_number=str(i), street_name="Palm Avenue") for i in range(1,201)]
 
     # Mock notification service to avoid actual HTTP calls
     with patch("app.services.landlords.notification_service.send_registration_email", new_callable=AsyncMock) as mock_send:
@@ -110,20 +102,18 @@ async def test_import_landlords_bulk_200(client, db_session):
         
         assert response.status_code == 200
         assert len(response.json()) == 200
-        assert all(res["status"] == "success" for res in response.json())
+        assert all(res["status"] == "queued" for res in response.json())
         
-        # Verify a random user from the list
         from sqlalchemy import select
-        result = await db_session.execute(select(User).where(User.email == "landlord100@bulktest.com"))
-        user = result.scalar_one_or_none()
-        assert user is not None
-        assert UserRole.LANDLORD in user.roles
-        assert user.app_id == app_id
+        from app.models.onboarding import LandlordOnboardingJob
+        jobs=(await db_session.execute(select(LandlordOnboardingJob))).scalars().all()
+        assert len(jobs)==200 and all(job.status=='queued' for job in jobs)
+        assert mock_send.call_count==0
 
 @pytest.mark.asyncio
 async def test_import_landlords_unauthorized(client, db_session):
     app_id = "RP-NONSTE"
-    import_data = [{"email": "landlord@test.com"}]
+    import_data = [{"email": "landlord@test.com", "name":"Test", "phone":"+2348012345678", "house_number":"12"}]
     headers = {"X-App-Id": app_id} # No auth token
     
     response = await client.post("/api/v1/landlords/import", json=import_data, headers=headers)

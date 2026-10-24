@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from typing import Optional, Dict, Any, Tuple
@@ -15,11 +16,22 @@ except ImportError:
     REDIS_AVAILABLE = False
 
 _redis_client: Optional[Any] = None
+_redis_loop: Optional[Any] = None
 
 def get_redis_client() -> Optional[Any]:
-    global _redis_client
+    global _redis_client, _redis_loop
     if not REDIS_AVAILABLE:
         return None
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if _redis_client is not None and _redis_loop is not None and current_loop is not None:
+        if _redis_loop is not current_loop or current_loop.is_closed():
+            _redis_client = None
+            _redis_loop = None
+
     if _redis_client is None:
         try:
             _redis_client = aioredis.from_url(
@@ -29,9 +41,11 @@ def get_redis_client() -> Optional[Any]:
                 socket_timeout=1.5,
                 socket_connect_timeout=1.5
             )
+            _redis_loop = current_loop
         except Exception as e:
             logger.warning(f"Could not connect to Redis: {e}")
             _redis_client = None
+            _redis_loop = None
     return _redis_client
 
 async def close_redis():
@@ -809,6 +823,71 @@ async def check_rate_limit(
         logger.debug(f"Redis check_rate_limit error: {e}")
         return True, 1, 0
 
+# --- Async Chat Message Queue (Non-blocking chat message delivery & DB persistence) ---
 
+CHAT_MESSAGE_QUEUE_KEY = "residence:chat_message:queue"
 
+async def enqueue_chat_message(payload: Dict[str, Any]) -> bool:
+    """Push a chat message event onto Redis for worker batch insert."""
+    client = get_redis_client()
+    if not client:
+        return False
+    try:
+        await client.rpush(CHAT_MESSAGE_QUEUE_KEY, json.dumps(payload, default=str))
+        return True
+    except Exception as e:
+        logger.debug(f"Redis enqueue_chat_message error: {e}")
+        return False
 
+async def dequeue_chat_messages(batch_size: int = 100) -> list:
+    """
+    Pop up to batch_size chat-message payloads (FIFO).
+    Returns list of (raw_json_str, parsed_dict) so callers can re-queue on DB failure.
+    """
+    client = get_redis_client()
+    if not client:
+        return []
+    items = []
+    try:
+        try:
+            raw_batch = await client.lpop(CHAT_MESSAGE_QUEUE_KEY, batch_size)
+        except TypeError:
+            raw_batch = None
+        if raw_batch is None:
+            raw_batch = []
+            for _ in range(batch_size):
+                raw = await client.lpop(CHAT_MESSAGE_QUEUE_KEY)
+                if raw is None:
+                    break
+                raw_batch.append(raw)
+        elif isinstance(raw_batch, str):
+            raw_batch = [raw_batch]
+
+        for raw in raw_batch:
+            items.append((raw, json.loads(raw)))
+    except Exception as e:
+        logger.debug(f"Redis dequeue_chat_messages error: {e}")
+    return items
+
+async def requeue_chat_messages(raw_items: list) -> bool:
+    """Put raw JSON payloads back on the queue after a failed DB commit."""
+    if not raw_items:
+        return True
+    client = get_redis_client()
+    if not client:
+        return False
+    try:
+        await client.rpush(CHAT_MESSAGE_QUEUE_KEY, *raw_items)
+        return True
+    except Exception as e:
+        logger.error(f"Redis requeue_chat_messages error: {e}")
+        return False
+
+async def chat_message_queue_length() -> int:
+    client = get_redis_client()
+    if not client:
+        return 0
+    try:
+        return int(await client.llen(CHAT_MESSAGE_QUEUE_KEY))
+    except Exception:
+        return 0

@@ -10,7 +10,8 @@ from app.services import admin as admin_service
 
 router = APIRouter()
 
-@router.get("/", response_model=List[AdminEstateDetailSchema], tags=["saas_admin_estates"])
+@router.get("", response_model=List[AdminEstateDetailSchema], tags=["saas_admin_estates"])
+@router.get("/", response_model=List[AdminEstateDetailSchema], tags=["saas_admin_estates"], include_in_schema=False)
 async def list_all_estates(
     search: Optional[str] = Query(None, description="Search estate by name or app_id"),
     is_active: Optional[bool] = Query(None, description="Filter by active/suspended status"),
@@ -46,4 +47,4 @@ async def update_estate_status(
     Suspend or reactivate an estate.
     Suspended estates have access immediately blocked at the gateway and API.
     """
-    return await admin_service.update_estate_status_admin(db, estate_id, status_in.is_active)
+    return await admin_service.update_estate_status_admin(db, estate_id, status_in.is_active, actor=admin)

@@ -10,7 +10,8 @@ from app.services import admin as admin_service
 
 router = APIRouter()
 
-@router.get("/", response_model=List[AdminUserDetailSchema], tags=["saas_admin_users"])
+@router.get("", response_model=List[AdminUserDetailSchema], tags=["saas_admin_users"])
+@router.get("/", response_model=List[AdminUserDetailSchema], tags=["saas_admin_users"], include_in_schema=False)
 async def search_users(
     query: Optional[str] = Query(None, description="Search by email, name, RFID, or app_id"),
     role: Optional[str] = Query(None, description="Filter by role"),
@@ -32,4 +33,4 @@ async def set_user_revocation(
     Globally revoke or reinstate a user account.
     Instantly invalidates their cached profile in Redis.
     """
-    return await admin_service.set_user_revocation_admin(db, user_id, revoke_in.is_revoked)
+    return await admin_service.set_user_revocation_admin(db, user_id, revoke_in.is_revoked, actor=admin)

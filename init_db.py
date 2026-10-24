@@ -5,6 +5,8 @@ from app.models.estate import Estate, Subscription
 from app.models.user import User
 from app.models.token import RegistrationToken, VisitorToken
 from app.models.access_log import AccessLog
+from app.models.admin_audit import AdminAuditLog
+from app.models.chat import GateSite, ChatThread, ChatMessage  # noqa: F401
 
 async def init_db():
     async with engine.begin() as conn:

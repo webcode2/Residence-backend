@@ -117,6 +117,8 @@ async def test_billing_cycles_and_subscription_expiration(db_session):
 async def test_cleanup_expired_tokens(db_session):
     resident_id = uuid.uuid4()
     app_id = "RP-TOKENS"
+    db_session.add(User(id=resident_id,email='cleanup@example.com',hashed_password='unused',roles=[UserRole.RESIDENT],app_id=app_id))
+    await db_session.flush()
 
     # 1. Stale pending visitor token (past expires_at)
     stale_token = VisitorToken(
@@ -168,7 +170,10 @@ async def test_admin_on_demand_maintenance_endpoint(client, db_session):
     admin_token = create_saas_admin_access_token(data={"sub": admin_user.email, "roles": ["saas_owner"]})
     headers = {"Authorization": f"Bearer {admin_token}"}
 
-    resp = await client.post("/api/v1/admin/maintenance/run", headers=headers)
+    from unittest.mock import patch, AsyncMock
+    # This endpoint test is independent of queues left by other isolated tests.
+    with patch('app.services.maintenance.drain_access_log_queue',new_callable=AsyncMock,return_value=0), patch('app.services.maintenance.drain_token_state_queue',new_callable=AsyncMock,return_value=0), patch('app.services.maintenance.drain_chat_message_queue',new_callable=AsyncMock,return_value=0):
+        resp = await client.post("/api/v1/admin/maintenance/run", headers=headers)
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "success"

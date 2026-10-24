@@ -16,6 +16,7 @@ async def create_user(db: AsyncSession, user_in: UserCreateSchema) -> User:
     db_obj = User(
         email=user_in.email,
         full_name=user_in.full_name,
+        phone=user_in.phone,
         hashed_password=get_password_hash(user_in.password),
         roles=user_in.roles,
         rfid_tag=user_in.rfid_tag,
@@ -36,56 +37,43 @@ async def get_user_by_email(db: AsyncSession, email: str, app_id: Optional[str] 
     result = await db.execute(query)
     return result.scalar_one_or_none()
 
-async def register_resident(db: AsyncSession, user_in: UserCreateSchema, registration_code: str, app_id: str) -> Optional[User]:
+async def register_resident(db: AsyncSession, user_in: UserCreateSchema, registration_code: str, app_id: Optional[str] = None) -> Optional[User]:
     """Register a resident using a registration token."""
-    # Verify token
-    token_result = await db.execute(
-        select(RegistrationToken).where(
-            RegistrationToken.code == registration_code,
-            RegistrationToken.app_id == app_id,
-            RegistrationToken.is_used == False,
-            RegistrationToken.is_revoked == False
-        )
-    )
-    token = token_result.scalar_one_or_none()
+    from datetime import datetime, UTC
+    from app.models.user import UserRole
+    from app.core.redis import invalidate_cached_registration_token
+    token = (await db.execute(select(RegistrationToken).where(
+        RegistrationToken.code == registration_code.strip().upper(),
+        *([RegistrationToken.app_id == app_id] if app_id else []),
+        RegistrationToken.is_used.is_(False), RegistrationToken.is_revoked.is_(False),
+        RegistrationToken.expires_at > datetime.now(UTC).replace(tzinfo=None),
+    ).with_for_update())).scalar_one_or_none()
     if not token:
         return None
-    
-    # Create or update resident
-    user_result = await db.execute(select(User).where(User.email == user_in.email, User.app_id == app_id))
-    db_obj = user_result.scalar_one_or_none()
-    
-    from app.models.user import UserRole
-    
-    if db_obj:
-        # Existing user: Add resident role if missing
-        if UserRole.RESIDENT not in db_obj.roles:
-            new_roles = list(db_obj.roles)
-            new_roles.append(UserRole.RESIDENT)
-            db_obj.roles = new_roles
-            if not db_obj.landlord_id:
-                db_obj.landlord_id = token.landlord_id
-                db_obj.house_number = token.house_number
-                db_obj.street_name = token.street_name
-    else:
-        # New user
-        db_obj = User(
-            email=user_in.email,
-            full_name=user_in.full_name,
-            hashed_password=get_password_hash(user_in.password),
-            roles=[UserRole.RESIDENT],
-            rfid_tag=user_in.rfid_tag,
-            house_number=token.house_number,
-            street_name=token.street_name,
-            app_id=app_id,
-            landlord_id=token.landlord_id
-        )
-        db.add(db_obj)
-    
-    # Mark token as used
+    app_id = token.app_id
+    from app.models.estate import Estate
+    estate_active = await db.scalar(select(Estate.id).where(Estate.app_id == app_id, Estate.is_active.is_(True)))
+    if not estate_active:
+        return None
+    host = (await db.execute(select(User).where(User.id == token.landlord_id,
+        User.app_id == app_id, User.is_revoked.is_(False)))).scalar_one_or_none()
+    if not host or UserRole.LANDLORD not in host.roles or host.must_change_password:
+        return None
+    # A public invitation must never change or relink an existing account.
+    if await get_user_by_email(db, str(user_in.email).lower()):
+        return None
+    if len(user_in.password) < 12 or len(user_in.password.encode('utf-8')) > 72:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail="Use at least 12 characters and no more than 72 UTF-8 bytes")
+    db_obj = User(email=str(user_in.email).lower(), full_name=user_in.full_name,
+        phone=user_in.phone, hashed_password=get_password_hash(user_in.password),
+        roles=[UserRole.RESIDENT], house_number=token.house_number,
+        street_name=token.street_name, app_id=app_id, landlord_id=token.landlord_id,
+        invitation_id=token.id, relationship_type=token.relationship_type)
+    db.add(db_obj)
     token.is_used = True
-    
     await db.commit()
+    await invalidate_cached_registration_token(app_id, token.code)
     await db.refresh(db_obj)
     return db_obj
 
@@ -107,6 +95,7 @@ async def update_user(db: AsyncSession, user_id: uuid.UUID, user_in: UserUpdateS
         update_data["hashed_password"] = get_password_hash(update_data.pop("password"))
 
     old_rfid = db_obj.rfid_tag
+    old_email = db_obj.email
     for field, value in update_data.items():
         setattr(db_obj, field, value)
         
@@ -116,6 +105,8 @@ async def update_user(db: AsyncSession, user_id: uuid.UUID, user_in: UserUpdateS
     # Invalidate Redis user session + RFID caches
     from app.core.redis import invalidate_cached_user, invalidate_cached_rfid_user
     await invalidate_cached_user(app_id, db_obj.email)
+    if old_email != db_obj.email:
+        await invalidate_cached_user(app_id, old_email)
     await invalidate_cached_rfid_user(app_id, old_rfid)
     if db_obj.rfid_tag and db_obj.rfid_tag != old_rfid:
         await invalidate_cached_rfid_user(app_id, db_obj.rfid_tag)
@@ -129,11 +120,51 @@ async def delete_user(db: AsyncSession, user_id: uuid.UUID, app_id: str) -> bool
     
     email = db_obj.email
     rfid_tag = db_obj.rfid_tag
-    await db.delete(db_obj)
+    # Preserve conversation history and officer attribution when removing an account.
+    # These foreign keys otherwise cascade-delete the estate's audit trail.
+    from app.models.chat import ChatMessage, ChatThread
+    has_threads = await db.scalar(select(ChatThread.id).where(
+        ChatThread.resident_id == user_id
+    ).limit(1))
+    has_messages = await db.scalar(select(ChatMessage.id).where(
+        ChatMessage.sender_id == user_id
+    ).limit(1))
+    has_household = await db.scalar(select(User.id).where(User.landlord_id == user_id).limit(1))
+    has_invitations = await db.scalar(select(RegistrationToken.id).where(RegistrationToken.landlord_id == user_id).limit(1))
+    from app.models.onboarding import LandlordOnboardingJob, LandlordImportFile
+    has_onboarding = await db.scalar(select(LandlordOnboardingJob.id).where(LandlordOnboardingJob.user_id == user_id).limit(1))
+    has_uploads = await db.scalar(select(LandlordImportFile.id).where(LandlordImportFile.uploaded_by == user_id).limit(1))
+    from app.models.sos import SOSAlert
+    has_sos = await db.scalar(select(SOSAlert.id).where(SOSAlert.sender_id == user_id).limit(1))
+    if has_threads or has_messages or has_household or has_invitations or has_onboarding or has_uploads or has_sos:
+        db_obj.is_revoked = True
+        db_obj.fcm_token = None
+    else:
+        await db.delete(db_obj)
     await db.commit()
 
     from app.core.redis import invalidate_cached_user, invalidate_cached_rfid_user
     await invalidate_cached_user(app_id, email)
     await invalidate_cached_rfid_user(app_id, rfid_tag)
 
+    return True
+
+async def update_user_fcm_token(db: AsyncSession, user_id: uuid.UUID, fcm_token: str) -> bool:
+    """Updates and persists the FCM device push notification token for the user."""
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        return False
+    from app.models.sos import PushDevice
+    device = await db.get(PushDevice, fcm_token)
+    if device:
+        device.user_id = user_id
+    else:
+        db.add(PushDevice(token=fcm_token, user_id=user_id))
+    # A physical device must stop receiving alerts for its previous account.
+    from sqlalchemy import update
+    await db.execute(update(User).where(User.fcm_token==fcm_token,User.id!=user_id).values(fcm_token=None))
+    user.fcm_token = fcm_token
+    await db.commit()
+    await db.refresh(user)
     return True

@@ -1,5 +1,5 @@
-from pydantic import BaseModel, ConfigDict
-from typing import Optional, List, Any
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Optional, List, Any, Literal
 from datetime import date
 import uuid
 from app.core.tiers import SubscriptionTier
@@ -13,6 +13,9 @@ class TierInfoSchema(BaseModel):
     log_retention_days: int
     realtime_alerts_enabled: bool
     description: str
+    discount_6_months: float = 0
+    discount_12_months: float = 0
+    quotes: List[dict] = Field(default_factory=list)
 
 class SubscriptionDetailSchema(BaseModel):
     id: uuid.UUID
@@ -36,8 +39,9 @@ class ChangeTierRequestSchema(BaseModel):
 
 class CheckoutSessionCreateSchema(BaseModel):
     tier: SubscriptionTier
-    success_url: Optional[str] = "https://residence.com/dashboard/billing/success"
-    cancel_url: Optional[str] = "https://residence.com/dashboard/billing/cancel"
+    billing_months: Literal[1, 6, 12] = 1
+    success_url: Optional[str] = "https://residence.com/dashboard/subscription?checkout=success"
+    cancel_url: Optional[str] = "https://residence.com/dashboard/subscription?checkout=cancelled"
 
 class CheckoutSessionResponseSchema(BaseModel):
     session_id: str
@@ -47,6 +51,12 @@ class CheckoutSessionResponseSchema(BaseModel):
     currency: str = "USD"
     status: str
     is_simulated: bool = False
+    is_sandbox: bool = False
+    returns_to_app: bool = True
+    billing_months: int = 1
+    discount_percent: float = 0
+    subtotal: float = 0
+    savings: float = 0
 
 class PaymentVerificationResponseSchema(BaseModel):
     session_id: str

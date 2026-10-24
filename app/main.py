@@ -5,6 +5,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status, Request
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,8 +15,10 @@ from app.core.config import settings
 from app.core.database import engine
 from app.core.redis import get_redis_client, close_redis
 from app.core.logging import setup_logging
-from app.api.v1.endpoints import verify, auth, users, tokens, estates, landlords, subscriptions, access_logs, payments
+from app.models import onboarding, history
+from app.api.v1.endpoints import verify, auth, users, tokens, estates, landlords, subscriptions, access_logs, payments, chat, sos
 from app.api.v1.endpoints.admin import admin_router
+from app.services.chat_websocket import chat_hub
 
 from app.core.scheduler import start_maintenance_scheduler, stop_maintenance_scheduler
 
@@ -26,9 +29,23 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     setup_logging()
     logger.info(f"Starting {settings.PROJECT_NAME} in [{settings.ENVIRONMENT.upper()}] mode")
+    from app.services.sos import start_worker
+    start_worker()
+    from app.services.landlords import start_worker as start_onboarding_worker
+    start_onboarding_worker()
+    from app.services.history_jobs import start_worker as start_history_worker
+    start_history_worker()
     start_maintenance_scheduler()
+    await chat_hub.start()
     yield
     logger.info(f"Initiating graceful shutdown for {settings.PROJECT_NAME}...")
+    from app.services.sos import stop_worker
+    await stop_worker()
+    await chat_hub.stop()
+    from app.services.landlords import stop_worker as stop_onboarding_worker
+    await stop_onboarding_worker()
+    from app.services.history_jobs import stop_worker as stop_history_worker
+    await stop_history_worker()
     await stop_maintenance_scheduler()
     await close_redis()
     await engine.dispose()
@@ -93,7 +110,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
-            "detail": exc.errors(),
+            "detail": jsonable_encoder(exc.errors()),
             "status_code": 422,
             "request_id": req_id
         }
@@ -126,6 +143,9 @@ app.include_router(landlords.router, prefix=f"{settings.API_V1_STR}/landlords", 
 app.include_router(subscriptions.router, prefix=f"{settings.API_V1_STR}/subscriptions", tags=["subscriptions"])
 app.include_router(payments.router, prefix=f"{settings.API_V1_STR}/payments", tags=["payments"])
 app.include_router(access_logs.router, prefix=f"{settings.API_V1_STR}/access-logs", tags=["access_logs"])
+app.include_router(chat.router, prefix=f"{settings.API_V1_STR}/chat", tags=["chat"])
+from app.api.v1.endpoints import dashboard
+app.include_router(dashboard.router, prefix=f"{settings.API_V1_STR}/dashboard", tags=["estate_dashboard"])
 app.include_router(admin_router, prefix=f"{settings.API_V1_STR}/admin", tags=["saas_admin"])
 
 # --- 6. Health & Readiness Probes (Orchestration & Uptime) ---
@@ -176,3 +196,8 @@ async def readiness_check():
     return status_report
 
 
+
+app.include_router(sos.router, prefix=f"{settings.API_V1_STR}/sos", tags=["estate_sos"])
+
+from app.api.v1.endpoints import notification_inbox
+app.include_router(notification_inbox.router, prefix=f"{settings.API_V1_STR}/notifications", tags=["notifications"])

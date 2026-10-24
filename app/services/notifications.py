@@ -2,6 +2,7 @@ import httpx
 from typing import Optional
 from app.core.config import settings
 import logging
+from html import escape
 
 logger = logging.getLogger(__name__)
 
@@ -20,22 +21,25 @@ class ResendClient:
             return f"{settings.RESEND_SENDER_NAME} <{settings.RESEND_SENDER_EMAIL}>"
         return settings.RESEND_SENDER_EMAIL
 
-    async def send_registration_email(self, email: str, password: str) -> bool:
+    async def send_registration_email(self, email: str, password: str, full_name: str = "", app_id: str = "", idempotency_key: str | None = None) -> bool:
         """Send account registration email with initial credentials."""
         if not self.api_key:
-            logger.info(f"[SIMULATED EMAIL via Resend] Registration email to {email} with initial password.")
-            return True
+            logger.error("Welcome email not sent: Resend credentials are missing")
+            return False
 
+        recipient = email
+        email, password, full_name, app_id = map(escape, (email, password, full_name, app_id))
         email_data = {
             "from": self.sender,
-            "to": [email],
+            "to": [recipient],
             "subject": "Your Resident Pass Account",
             "html": f"""
                 <h2>Welcome to Resident Pass</h2>
-                <p>Your account has been created successfully.</p>
+                <p>Hello {full_name}, your landlord account has been created.</p>
+                <p><b>Estate App ID:</b> {app_id}</p>
                 <p><b>Login Email:</b> {email}</p>
                 <p><b>Initial Password:</b> {password}</p>
-                <p>Please log in and change your password immediately.</p>
+                <p>Sign in to the Residence app with this temporary password. You must choose a new password before accessing the app. You can then invite family members or tenants to your household.</p>
             """,
         }
 
@@ -46,7 +50,8 @@ class ResendClient:
                     json=email_data,
                     headers={
                         "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json"
+                        "Content-Type": "application/json",
+                        **({"Idempotency-Key": idempotency_key} if idempotency_key else {})
                     },
                     timeout=10.0
                 )

@@ -8,6 +8,8 @@ from app.core.database import get_db
 from app.models.user import User, UserRole
 from app.models.estate import Estate
 from app.schemas.user import TokenDataSchema
+from app.services.auth import token_matches_user
+from datetime import datetime
 from typing import List
 import uuid
 
@@ -50,7 +52,7 @@ class ValidateTenant:
         result = await db.execute(select(Estate).where(Estate.app_id == x_app_id))
         estate = result.scalar_one_or_none()
        
-        if not estate:
+        if not estate or not estate.is_active:
             await set_cached_estate_validity(x_app_id, is_valid=False, ttl_seconds=300)
             if self.is_auth_route:
                 raise HTTPException(
@@ -71,7 +73,7 @@ validate_tenant = ValidateTenant()
 
 
 
-async def get_current_user(
+async def get_authenticated_user(
     token: str = Depends(oauth2_scheme),
     db: AsyncSession = Depends(get_db),
     app_id: str = Depends(validate_tenant)
@@ -109,7 +111,10 @@ async def get_current_user(
 
     # 2. Fast-path: Check Redis user profile cache
     cached_user = await get_cached_user(token_data.app_id, token_data.email)
-    if cached_user:
+    if cached_user and (payload.get("uid") or cached_user.get("created_at")):
+        cached_identity = User(id=uuid.UUID(cached_user["id"]), created_at=datetime.fromisoformat(cached_user["created_at"]) if cached_user.get("created_at") else None)
+        if not token_matches_user(payload, cached_identity):
+            raise credentials_exception
         if cached_user.get("is_revoked", False):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -125,6 +130,7 @@ async def get_current_user(
             rfid_tag=cached_user.get("rfid_tag"),
             house_number=cached_user.get("house_number"),
             street_name=cached_user.get("street_name"),
+            must_change_password=cached_user.get("must_change_password", False),
             is_revoked=cached_user.get("is_revoked", False),
             app_id=cached_user["app_id"],
             landlord_id=uuid.UUID(cached_user["landlord_id"]) if cached_user.get("landlord_id") else None
@@ -135,7 +141,7 @@ async def get_current_user(
         select(User).where(User.email == token_data.email, User.app_id == token_data.app_id)
     )
     user = result.scalar_one_or_none()
-    if user is None:
+    if user is None or not token_matches_user(payload, user):
         raise credentials_exception
         
     if user.is_revoked:
@@ -151,6 +157,7 @@ async def get_current_user(
         email=token_data.email,
         user_data={
             "id": str(user.id),
+            "created_at": user.created_at.isoformat(),
             "email": user.email,
             "full_name": user.full_name,
             "hashed_password": user.hashed_password,
@@ -159,6 +166,7 @@ async def get_current_user(
             "house_number": user.house_number,
             "street_name": user.street_name,
             "is_revoked": user.is_revoked,
+            "must_change_password": user.must_change_password,
             "app_id": user.app_id,
             "landlord_id": str(user.landlord_id) if user.landlord_id else None
         },
@@ -166,6 +174,16 @@ async def get_current_user(
     )
 
     return user
+
+async def get_current_user(
+    current_user: User = Depends(get_authenticated_user),
+    token: str = Depends(oauth2_scheme),
+) -> User:
+    payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    if current_user.must_change_password or payload.get("purpose") == "password_change":
+        raise HTTPException(status_code=403, detail="Password change required before accessing the app")
+    return current_user
+
 
 def check_roles(allowed_roles: List[UserRole]):
     async def role_checker(current_user: User = Depends(get_current_user)):
@@ -186,7 +204,10 @@ async def check_user_access(
     current_user: User = Depends(get_current_user)
 ) -> User:
     """Validate if current user can access data for given user_id."""
-    # SaaS Admin (Caretaker) can access everyone in their tenant
+    if current_user.id == user_id:
+        return current_user
+
+    # Caretakers can access everyone in their tenant
     if UserRole.CARETAKER in current_user.roles:
         target_user_result = await db.execute(
             select(User).where(User.id == user_id, User.app_id == current_user.app_id)
@@ -199,7 +220,7 @@ async def check_user_access(
     # Landlord can access their residents
     if UserRole.LANDLORD in current_user.roles:
         target_user_result = await db.execute(
-            select(User).where(User.id == user_id, User.landlord_id == current_user.id)
+            select(User).where(User.id == user_id, User.landlord_id == current_user.id, User.app_id == current_user.app_id)
         )
         target_user = target_user_result.scalar_one_or_none()
         if not target_user:
@@ -233,7 +254,7 @@ async def get_current_saas_admin(
     try:
         payload = jwt.decode(token, settings.SAAS_ADMIN_SECRET_KEY, algorithms=[settings.ALGORITHM])
         email: str = payload.get("sub")
-        if email is None:
+        if email is None or payload.get("scope") != "saas_admin":
             raise credentials_exception
     except JWTError:
         raise credentials_exception

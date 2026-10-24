@@ -26,14 +26,13 @@ async def test_register_estate_success(client, db_session):
     assert UserRole.CARETAKER in user.roles
 
 @pytest.mark.asyncio
-async def test_list_estates(client, db_session):
+async def test_list_estates_requires_owner(client, db_session):
     response = await client.get("/api/v1/estates/")
-    assert response.status_code == 200
-    assert isinstance(response.json(), list)
+    assert response.status_code == 401
 
 
 @pytest.mark.asyncio
-async def test_estate_token_code_length_settings_and_az_generation(client, db_session):
+async def test_estate_token_code_length_settings_and_alphanumeric_generation(client, db_session):
     """
     Test that:
     1. Default token length is 6 uppercase A-Z characters.
@@ -80,26 +79,30 @@ async def test_estate_token_code_length_settings_and_az_generation(client, db_se
     assert settings_resp.status_code == 200
     assert settings_resp.json()["token_code_length"] == 6
 
-    # 2. Generate visitor token -> length must be 6, and only uppercase A-Z
+    # 2. Generate visitor token -> length must be 6, and uppercase letters and digits
     t1_resp = await client.post("/api/v1/tokens/visitor", json={"visitor_name": "Guest 6-char"}, headers=headers)
     assert t1_resp.status_code == 200
     code_6 = t1_resp.json()["code"]
     assert len(code_6) == 6
-    assert code_6.isalpha() and code_6.isupper()
+    assert sum(c.isdigit() for c in code_6) == 5
+    assert sum(c.isalpha() for c in code_6) == 1
+    assert code_6.isalnum() and any(c.isdigit() for c in code_6) and any(c.isalpha() for c in code_6) and code_6.isupper()
 
-    # 3. Update estate setting to 8 characters
-    patch_resp = await client.patch("/api/v1/estates/settings", json={"token_code_length": 8}, headers=headers)
+    # 3. Update estate setting to an allowed 5 characters
+    patch_resp = await client.patch("/api/v1/estates/settings", json={"token_code_length": 5}, headers=headers)
     assert patch_resp.status_code == 200
-    assert patch_resp.json()["token_code_length"] == 8
+    assert patch_resp.json()["token_code_length"] == 5
 
-    # 4. Generate new visitor token -> length must now be 8, and only uppercase A-Z
+    # 4. Generate new visitor token -> length must now be 5, and uppercase letters and digits
     t2_resp = await client.post("/api/v1/tokens/visitor", json={"visitor_name": "Guest 8-char"}, headers=headers)
     assert t2_resp.status_code == 200
     code_8 = t2_resp.json()["code"]
-    assert len(code_8) == 8
-    assert code_8.isalpha() and code_8.isupper()
+    assert len(code_8) == 5
+    assert sum(c.isdigit() for c in code_8) == 4
+    assert sum(c.isalpha() for c in code_8) == 1
+    assert code_8.isalnum() and any(c.isdigit() for c in code_8) and any(c.isalpha() for c in code_8) and code_8.isupper()
 
-    # 5. Invalid length (e.g. 5) -> must be rejected (422)
-    invalid_patch = await client.patch("/api/v1/estates/settings", json={"token_code_length": 5}, headers=headers)
+    # 5. Invalid length (e.g. 7) -> must be rejected (422)
+    invalid_patch = await client.patch("/api/v1/estates/settings", json={"token_code_length": 7}, headers=headers)
     assert invalid_patch.status_code == 422
 

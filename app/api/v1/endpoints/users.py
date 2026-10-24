@@ -1,15 +1,44 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Header
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List
+from typing import List, Optional
 from app.core.database import get_db
-from app.schemas.user import UserSchema, UserCreateSchema, UserUpdateSchema
+from app.schemas.user import UserSchema, UserCreateSchema, ResidentRegistrationSchema, SelfProfileUpdateSchema, AuthResponseSchema, UserUpdateSchema, FCMTokenUpdateSchema
 from app.schemas.estate import EstateRegistrationRequestSchema, EstateRegistrationResponseSchema
 from app.services import users as user_service, estates as estate_service
-from app.dependencies import validate_tenant, check_roles
-from app.models.user import UserRole
+from app.dependencies import validate_tenant, check_roles, get_current_user, check_user_access, oauth2_scheme
+from app.models.user import User, UserRole
 import uuid
 
 router = APIRouter()
+
+@router.post("/me/fcm-token", response_model=dict, tags=["users"])
+async def update_my_fcm_token(
+    fcm_in: FCMTokenUpdateSchema,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Update or register the FCM device push notification token for the logged-in user.
+    Called automatically on app launch, login, or when FCM rotates the device token.
+    """
+    success = await user_service.update_user_fcm_token(db, current_user.id, fcm_in.fcm_token)
+    if not success:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"status": "success", "message": "FCM token synced successfully"}
+
+@router.get("/me/profile", response_model=UserSchema, tags=["profiling"])
+async def get_my_profile(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return await db.get(User, current_user.id, populate_existing=True)
+
+@router.patch("/me/profile", response_model=AuthResponseSchema, tags=["profiling"])
+async def update_my_profile(
+    profile: SelfProfileUpdateSchema,
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.profiles import update_profile
+    return await update_profile(db, current_user, profile, token)
 
 @router.post("/register-tenant", response_model=EstateRegistrationResponseSchema, tags=["auth"])
 async def create_app_admin_account(
@@ -37,6 +66,10 @@ async def create_user(
     current_user = Depends(check_roles([UserRole.CARETAKER]))
 ):
     """Create a new user within the current tenant."""
+    if UserRole.SAAS_OWNER in user_in.roles:
+        raise HTTPException(status_code=403, detail="Platform owner roles cannot be assigned by estate accounts")
+    if UserRole.LANDLORD in user_in.roles:
+        raise HTTPException(status_code=409, detail="Landlords must be onboarded through the caretaker import queue")
     # Ensure app_id in payload matches the header app_id for safety
     user_in.app_id = app_id
     
@@ -51,12 +84,12 @@ async def create_user(
 # Register resident using registration code
 @router.post("/register", response_model=UserSchema, tags=["users"])
 async def register_resident(
-    user_in: UserCreateSchema,
+    user_in: ResidentRegistrationSchema,
     registration_code: str = Query(..., description="9-char registration code"),
-    app_id: str = Depends(validate_tenant),
+    x_app_id: Optional[str] = Header(None, alias="X-App-Id"),
     db: AsyncSession = Depends(get_db)
 ):
-    user = await user_service.register_resident(db, user_in, registration_code, app_id)
+    user = await user_service.register_resident(db, user_in, registration_code, x_app_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -78,8 +111,9 @@ async def get_user(
     user_id: uuid.UUID,
     app_id: str = Depends(validate_tenant),
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(check_roles([UserRole.CARETAKER, UserRole.LANDLORD, UserRole.RESIDENT]))
+    current_user = Depends(get_current_user)
 ):
+    await check_user_access(user_id, db, current_user)
     user = await user_service.get_user(db, user_id, app_id)
     if not user:
         raise HTTPException(
@@ -94,8 +128,19 @@ async def update_user(
     user_in: UserUpdateSchema,
     app_id: str = Depends(validate_tenant),
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(check_roles([UserRole.CARETAKER, UserRole.LANDLORD, UserRole.RESIDENT]))
+    current_user = Depends(get_current_user)
 ):
+    if UserRole.CARETAKER not in current_user.roles:
+        if current_user.id != user_id:
+            raise HTTPException(status_code=403, detail="You can only update your own profile")
+        if user_in.model_fields_set - {"full_name", "password"}:
+            raise HTTPException(status_code=403, detail="Only caretakers can change estate account permissions and identity")
+    if user_in.roles is not None and UserRole.SAAS_OWNER in user_in.roles:
+        raise HTTPException(status_code=403, detail="Platform owner roles cannot be assigned by estate accounts")
+    if user_in.roles is not None and UserRole.LANDLORD in user_in.roles:
+        target = await user_service.get_user(db, user_id, app_id)
+        if target and UserRole.LANDLORD not in target.roles:
+            raise HTTPException(status_code=409, detail="Landlords must be onboarded through the caretaker import queue")
     user = await user_service.update_user(db, user_id, user_in, app_id)
     if not user:
         raise HTTPException(
@@ -118,3 +163,12 @@ async def delete_user(
             detail="User not found"
         )
     return None
+@router.delete("/me/fcm-token", tags=["users"])
+async def unregister_my_device(fcm_in: FCMTokenUpdateSchema, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    from sqlalchemy import delete, select
+    from app.models.sos import PushDevice
+    await db.execute(delete(PushDevice).where(PushDevice.token==fcm_in.fcm_token,PushDevice.user_id==current_user.id))
+    user = await db.get(User,current_user.id)
+    if user and user.fcm_token==fcm_in.fcm_token: user.fcm_token=None
+    await db.commit()
+    return {"status":"success"}

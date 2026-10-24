@@ -1,3 +1,4 @@
+from app.services.plans import get_plan
 from typing import Optional, List, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc, or_
@@ -17,6 +18,7 @@ from app.core.redis import invalidate_subscription_cache, invalidate_cached_user
 from datetime import datetime, UTC
 from fastapi import HTTPException, status
 import uuid
+from app.models.admin_audit import AdminAuditLog
 
 async def get_saas_overview(db: AsyncSession) -> dict:
     """Calculates platform-wide KPIs for the SaaS Admin dashboard."""
@@ -48,7 +50,7 @@ async def get_saas_overview(db: AsyncSession) -> dict:
     total_verifications_this_month = 0
 
     for sub in all_subs:
-        if sub.status == "active":
+        if sub.status == "active" and sub.expiry_date >= datetime.now(UTC).date():
             subscriptions_by_tier[sub.tier] = subscriptions_by_tier.get(sub.tier, 0) + 1
             estimated_mrr += float(sub.price_monthly or 0.0)
         total_verifications_this_month += sub.current_month_verifications
@@ -152,13 +154,16 @@ async def get_estate_detail_admin(db: AsyncSession, estate_id: uuid.UUID) -> dic
         "total_verifications": sub.current_month_verifications if sub else 0
     }
 
-async def update_estate_status_admin(db: AsyncSession, estate_id: uuid.UUID, is_active: bool) -> dict:
+async def update_estate_status_admin(db: AsyncSession, estate_id: uuid.UUID, is_active: bool, actor: Optional[User] = None) -> dict:
     result = await db.execute(select(Estate).where(Estate.id == estate_id))
     estate = result.scalar_one_or_none()
     if not estate:
         raise HTTPException(status_code=404, detail="Estate not found")
 
+    previous = estate.is_active
     estate.is_active = is_active
+    if actor:
+        db.add(AdminAuditLog(actor_id=actor.id, actor_email=actor.email, action="estate.status", target_type="estate", target_id=str(estate.id), changes={"is_active": {"before": previous, "after": is_active}}))
     await db.commit()
     await db.refresh(estate)
 
@@ -172,7 +177,7 @@ async def list_subscriptions_admin(
     db: AsyncSession,
     status_filter: Optional[str] = None,
     tier_filter: Optional[str] = None
-) -> List[Subscription]:
+) -> List[dict]:
     query = select(Subscription).options(selectinload(Subscription.estate)).order_by(Subscription.expiry_date.asc())
     if status_filter:
         query = query.where(Subscription.status == status_filter)
@@ -180,12 +185,31 @@ async def list_subscriptions_admin(
         query = query.where(Subscription.tier == tier_filter)
 
     results = await db.execute(query)
-    return list(results.scalars().all())
+    subs = results.scalars().all()
+    out = []
+    for sub in subs:
+        out.append({
+            "estate_id": sub.estate_id,
+            "estate_name": sub.estate.name if sub.estate else None,
+            "app_id": sub.estate.app_id if sub.estate else None,
+            "status": sub.status,
+            "expiry_date": sub.expiry_date,
+            "tier": sub.tier,
+            "monthly_verifications_limit": sub.monthly_verifications_limit,
+            "current_month_verifications": sub.current_month_verifications,
+            "rfid_enabled": sub.rfid_enabled,
+            "log_retention_days": sub.log_retention_days,
+            "realtime_alerts_enabled": sub.realtime_alerts_enabled,
+            "price_monthly": sub.price_monthly,
+            "created_at": sub.created_at
+        })
+    return out
 
 async def override_subscription_admin(
     db: AsyncSession,
     estate_id: uuid.UUID,
-    override_in: AdminSubscriptionOverrideSchema
+    override_in: AdminSubscriptionOverrideSchema,
+    actor: Optional[User] = None,
 ) -> Subscription:
     result = await db.execute(
         select(Subscription).where(Subscription.estate_id == estate_id).options(selectinload(Subscription.estate))
@@ -194,8 +218,10 @@ async def override_subscription_admin(
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found for this estate")
 
+    tracked = ("tier", "status", "expiry_date", "monthly_verifications_limit", "rfid_enabled", "realtime_alerts_enabled", "log_retention_days", "price_monthly")
+    before = {key: str(getattr(sub, key)) for key in tracked}
     if override_in.tier is not None:
-        tier_cfg = get_tier_config(override_in.tier)
+        tier_cfg = await get_plan(db, override_in.tier)
         sub.tier = tier_cfg["tier"]
         sub.monthly_verifications_limit = tier_cfg["monthly_verifications_limit"]
         sub.rfid_enabled = tier_cfg["rfid_enabled"]
@@ -207,7 +233,7 @@ async def override_subscription_admin(
         sub.status = override_in.status
     if override_in.expiry_date is not None:
         sub.expiry_date = override_in.expiry_date
-    if override_in.monthly_verifications_limit is not None:
+    if "monthly_verifications_limit" in override_in.model_fields_set:
         sub.monthly_verifications_limit = override_in.monthly_verifications_limit
     if override_in.rfid_enabled is not None:
         sub.rfid_enabled = override_in.rfid_enabled
@@ -216,6 +242,9 @@ async def override_subscription_admin(
     if override_in.log_retention_days is not None:
         sub.log_retention_days = override_in.log_retention_days
 
+    if actor:
+        changes = {key: {"before": before[key], "after": str(getattr(sub, key))} for key in tracked if before[key] != str(getattr(sub, key))}
+        db.add(AdminAuditLog(actor_id=actor.id, actor_email=actor.email, action="subscription.update", target_type="estate", target_id=str(estate_id), changes=changes))
     await db.commit()
     await db.refresh(sub)
 
@@ -232,6 +261,11 @@ async def search_users_admin(
 ) -> List[dict]:
     """Search users across all tenants."""
     stmt = select(User).order_by(User.created_at.desc()).limit(limit)
+    if role_filter:
+        try:
+            stmt = stmt.where(User.roles.contains([UserRole(role_filter)]))
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Unknown user role")
 
     if query_str:
         stmt = stmt.where(
@@ -263,7 +297,7 @@ async def search_users_admin(
             "full_name": u.full_name,
             "roles": role_vals,
             "app_id": u.app_id,
-            "estate_name": estate_names.get(u.app_id, "Unknown"),
+            "estate_name": estate_names.get(u.app_id, "Platform account" if "saas_owner" in role_vals else "Unknown estate"),
             "rfid_tag": u.rfid_tag,
             "house_number": u.house_number,
             "street_name": u.street_name,
@@ -273,13 +307,18 @@ async def search_users_admin(
 
     return results
 
-async def set_user_revocation_admin(db: AsyncSession, user_id: uuid.UUID, is_revoked: bool) -> dict:
+async def set_user_revocation_admin(db: AsyncSession, user_id: uuid.UUID, is_revoked: bool, actor: Optional[User] = None) -> dict:
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    if UserRole.SAAS_OWNER in user.roles:
+        raise HTTPException(status_code=403, detail="Platform-owner accounts cannot be revoked through tenant user management")
+    previous = user.is_revoked
     user.is_revoked = is_revoked
+    if actor:
+        db.add(AdminAuditLog(actor_id=actor.id, actor_email=actor.email, action="user.revocation", target_type="user", target_id=str(user.id), changes={"is_revoked": {"before": previous, "after": is_revoked}}))
     await db.commit()
     await db.refresh(user)
 
@@ -308,7 +347,7 @@ async def get_global_access_logs(
     status_filter: Optional[str] = None
 ) -> List[AccessLog]:
     """Query audit logs across all estates."""
-    query = select(AccessLog).order_by(AccessLog.timestamp.desc()).offset(offset).limit(limit)
+    query = select(AccessLog).order_by(AccessLog.created_at.desc()).offset(offset).limit(limit)
     if status_filter:
         query = query.where(AccessLog.status == status_filter)
 

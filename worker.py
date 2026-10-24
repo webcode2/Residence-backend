@@ -14,8 +14,9 @@ from app.core.logging import setup_logging
 from app.services.maintenance import run_all_maintenance_jobs
 from app.services.access_logs import drain_access_log_queue
 from app.services.token_state import drain_token_state_queue
+from app.services.chat import drain_chat_message_queue
 # Register all ORM models so FK resolution works during batch inserts
-from app.models import estate, user, token, access_log  # noqa: F401
+from app.models import estate, user, token, access_log, chat  # noqa: F401
 
 logger = logging.getLogger("worker")
 
@@ -40,10 +41,11 @@ async def run_once() -> int:
 async def _queue_drain_loop(stop_event: asyncio.Event):
     """
     Buffer Redis queues for ~2s, then flush to Postgres in batches
-    (access logs via add_all, token states via coalesced executemany UPDATEs).
+    (access logs via add_all, token states via coalesced executemany UPDATEs, chat messages via batch insert).
     """
     interval = float(
-        getattr(settings, "TOKEN_STATE_DRAIN_INTERVAL_SECONDS", None)
+        getattr(settings, "CHAT_MESSAGE_DRAIN_INTERVAL_SECONDS", None)
+        or getattr(settings, "TOKEN_STATE_DRAIN_INTERVAL_SECONDS", None)
         or settings.ACCESS_LOG_DRAIN_INTERVAL_SECONDS
     )
     logger.info(f"Queue drain loop started (batch interval={interval}s)")
@@ -61,8 +63,9 @@ async def _queue_drain_loop(stop_event: asyncio.Event):
             async with SessionLocal() as db:
                 logs = await drain_access_log_queue(db)
                 tokens = await drain_token_state_queue(db)
-                if logs or tokens:
-                    logger.info(f"Batch drain complete: access_logs={logs} token_states={tokens}")
+                chat_msgs = await drain_chat_message_queue(db)
+                if logs or tokens or chat_msgs:
+                    logger.info(f"Batch drain complete: access_logs={logs} token_states={tokens} chat_messages={chat_msgs}")
         except Exception as e:
             logger.error(f"Queue drain error: {e}", exc_info=True)
 

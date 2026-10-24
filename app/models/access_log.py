@@ -19,6 +19,8 @@ class AccessLog(Base, ModelMixin, TenantMixin):
 
     __table_args__ = (
         Index("ix_access_logs_app_id_created_at", "app_id", "created_at"),
+        Index("ix_access_logs_estate_cursor", "app_id", "created_at", "id"),
+        Index("ix_access_logs_estate_status_cursor", "app_id", "status", "created_at", "id"),
         Index("ix_access_logs_app_id_status", "app_id", "status"),
         Index("ix_access_logs_app_id_user_id", "app_id", "user_id"),
     )

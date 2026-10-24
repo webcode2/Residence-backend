@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import uuid
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.core.redis import get_redis_client
@@ -9,6 +10,28 @@ logger = logging.getLogger(__name__)
 
 _scheduler_task: asyncio.Task | None = None
 _stop_event = asyncio.Event()
+
+async def _run_with_lease(redis,lock_key,lock_token,lock_ttl,operation):
+    """Keep ownership for long sweeps; never delete a successor's lock."""
+    async def renew():
+        while True:
+            await asyncio.sleep(lock_ttl/3)
+            renewed=await redis.eval("if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('expire',KEYS[1],ARGV[2]) else return 0 end",1,lock_key,lock_token,lock_ttl)
+            if not renewed:
+                raise RuntimeError('Maintenance lease lost; stopping this worker')
+    work=asyncio.create_task(operation())
+    renewal=asyncio.create_task(renew())
+    try:
+        done,_=await asyncio.wait({work,renewal},return_when=asyncio.FIRST_COMPLETED)
+        for task in done: await task
+    finally:
+        work.cancel();renewal.cancel()
+        await asyncio.gather(work,renewal,return_exceptions=True)
+        try:
+            await redis.eval("if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end",1,lock_key,lock_token)
+        except Exception:
+            pass
+
 
 async def _maintenance_worker_loop():
     """Continuous background loop executing automated maintenance tasks on interval."""
@@ -26,18 +49,15 @@ async def _maintenance_worker_loop():
         try:
             redis = await get_redis_client()
             lock_key = "residence:maintenance:lock"
-            lock_ttl = min(int(settings.MAINTENANCE_INTERVAL_SECONDS), 300)
+            lock_ttl = max(30,min(int(settings.MAINTENANCE_INTERVAL_SECONDS),300))
+            lock_token = uuid.uuid4().hex
             # Acquire distributed lock so only one worker process runs maintenance across multiple instances
-            acquired = await redis.set(lock_key, "locked", nx=True, ex=lock_ttl)
+            acquired = await redis.set(lock_key, lock_token, nx=True, ex=lock_ttl)
             if acquired:
-                try:
+                async def perform():
                     async with SessionLocal() as db:
                         await run_all_maintenance_jobs(db)
-                finally:
-                    try:
-                        await redis.delete(lock_key)
-                    except Exception:
-                        pass
+                await _run_with_lease(redis,lock_key,lock_token,lock_ttl,perform)
             else:
                 logger.debug("[SCHEDULER] Maintenance lock currently held by another worker. Skipping.")
         except Exception as e:
