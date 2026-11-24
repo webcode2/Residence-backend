@@ -1,6 +1,7 @@
 from pydantic_settings import BaseSettings
 from pydantic import ConfigDict, model_validator, field_validator, Field
 from typing import List, Union, Any
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 import json
 
 class Settings(BaseSettings):
@@ -92,9 +93,18 @@ class Settings(BaseSettings):
             return v_clean in ("true", "1", "yes", "t", "on")
         return bool(v)
 
+    @staticmethod
     def _as_asyncpg_url(url: str) -> str:
-        return url.replace("postgresql://", "postgresql+asyncpg://").replace(
-            "postgres://", "postgresql+asyncpg://"
+        # asyncpg handles TLS negotiation itself and rejects libpq-only params
+        # such as sslmode/channel_binding that Neon includes in its URLs.
+        parts = urlsplit(url.replace("postgres://", "postgresql://"))
+        query = [
+            (key, value)
+            for key, value in parse_qsl(parts.query)
+            if key not in ("sslmode", "channel_binding")
+        ]
+        return urlunsplit(
+            ("postgresql+asyncpg", parts.netloc, parts.path, urlencode(query), parts.fragment)
         )
 
     @property
