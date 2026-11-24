@@ -1,4 +1,5 @@
-version: "3.8"
+# MVP architecture: PostgreSQL directly (no PgBouncer) + remote Upstash Redis.
+# Set REDIS_URL to the Upstash rediss:// URL in .env before starting the stack.
 
 services:
   db:
@@ -19,36 +20,6 @@ services:
       timeout: 5s
       retries: 5
 
-  pgbouncer:
-    image: edoburu/pgbouncer:v1.23.1-p1
-    container_name: residence_pgbouncer
-    restart: always
-    environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-residence_db}
-      POOL_MODE: transaction
-      MAX_CLIENT_CONN: 200
-      DEFAULT_POOL_SIZE: 20
-      MIN_POOL_SIZE: 5
-      RESERVE_POOL_SIZE: 5
-      SERVER_RESET_QUERY: DISCARD ALL
-      AUTH_TYPE: scram-sha-256
-      LISTEN_PORT: 6432
-    ports:
-      - "6432:6432"
-    depends_on:
-      db:
-        condition: service_healthy
-
-  redis:
-    image: redis:7-alpine
-    container_name: residence_redis
-    restart: always
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes
-
   backend:
     build: .
     container_name: residence_backend
@@ -60,16 +31,15 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DB_USE_PGBOUNCER=true
+      - DB_USE_PGBOUNCER=false
       - DB_POOL_SIZE=5
       - DB_MAX_OVERFLOW=5
-      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@pgbouncer:6432/${POSTGRES_DB:-residence_db}
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-residence_db}
       - DIRECT_DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-residence_db}
-      - REDIS_URL=redis://redis:6379/0
+      - REDIS_URL=${REDIS_URL:?REDIS_URL must be set in .env (Upstash rediss:// URL)}
     depends_on:
-      - pgbouncer
-      - redis
+      db:
+        condition: service_healthy
 
 volumes:
   postgres_data:
-  redis_data:

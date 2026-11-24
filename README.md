@@ -75,8 +75,13 @@ The platform includes background routines for time-dependent lifecycle managemen
 ### 1. Environment Setup
 ```bash
 cp .env.example .env
-# Fill in DATABASE_URL, RESEND credentials, and BACHS API keys
+# Fill in DATABASE_URL, REDIS_URL (Upstash), RESEND credentials, and BACHS API keys
 ```
+
+> **MVP architecture (`mvp` branch):** PostgreSQL is used directly — no PgBouncer container — and Redis is remote via Upstash. Set `REDIS_URL` to the `rediss://` URL from the Upstash dashboard before starting the stack:
+> ```bash
+> docker compose -f docker-compose.prod.yml up -d --build
+> ```
 
 ### 2. Install Dependencies
 ```bash

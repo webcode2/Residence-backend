@@ -1,3 +1,6 @@
+# MVP architecture: PostgreSQL directly (no PgBouncer) + remote Upstash Redis.
+# REDIS_URL must be the Upstash rediss:// URL, supplied via .env.
+
 services:
   db:
     image: postgres:15-alpine
@@ -18,48 +21,6 @@ services:
       retries: 5
       start_period: 10s
 
-  pgbouncer:
-    image: edoburu/pgbouncer:v1.23.1-p1
-    container_name: residence_prod_pgbouncer
-    restart: unless-stopped
-    environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-residence_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-residence_db}
-      POOL_MODE: transaction
-      MAX_CLIENT_CONN: 200
-      DEFAULT_POOL_SIZE: 20
-      MIN_POOL_SIZE: 5
-      RESERVE_POOL_SIZE: 5
-      SERVER_RESET_QUERY: DISCARD ALL
-      AUTH_TYPE: scram-sha-256
-      LISTEN_PORT: 6432
-    networks:
-      - residence_internal
-    depends_on:
-      db:
-        condition: service_healthy
-    healthcheck:
-      test: [ "CMD-SHELL", "busybox nc -z 127.0.0.1 6432 || exit 1" ]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-
-  redis:
-    image: redis:7-alpine
-    container_name: residence_prod_redis
-    restart: unless-stopped
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}
-    volumes:
-      - redis_prod_data:/data
-    networks:
-      - residence_internal
-    healthcheck:
-      test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-}", "ping" ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 5s
-
   backend:
     build:
       context: .
@@ -72,14 +33,12 @@ services:
       - ./residence-336b6-firebase-adminsdk-fbsvc-6ef51abbb7.json:/app/residence-336b6-firebase-adminsdk-fbsvc-6ef51abbb7.json:ro
     environment:
       - ENVIRONMENT=production
-      - DB_USE_PGBOUNCER=true
+      - DB_USE_PGBOUNCER=false
       - DB_POOL_SIZE=5
       - DB_MAX_OVERFLOW=5
-      # App traffic through PgBouncer (transaction pooling)
-      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-residence_user}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB:-residence_db}
-      # Migrations / admin ops bypass the pooler
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-residence_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-residence_db}
       - DIRECT_DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-residence_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-residence_db}
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - REDIS_URL=${REDIS_URL:?REDIS_URL must be set in .env (Upstash rediss:// URL)}
       - ENABLE_MAINTENANCE_SCHEDULER=false
     ports:
       - "8000:8000"
@@ -87,10 +46,6 @@ services:
       - residence_internal
     depends_on:
       db:
-        condition: service_healthy
-      pgbouncer:
-        condition: service_healthy
-      redis:
         condition: service_healthy
 
   worker:
@@ -106,12 +61,12 @@ services:
       - ./residence-336b6-firebase-adminsdk-fbsvc-6ef51abbb7.json:/app/residence-336b6-firebase-adminsdk-fbsvc-6ef51abbb7.json:ro
     environment:
       - ENVIRONMENT=production
-      - DB_USE_PGBOUNCER=true
+      - DB_USE_PGBOUNCER=false
       - DB_POOL_SIZE=3
       - DB_MAX_OVERFLOW=2
-      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-residence_user}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB:-residence_db}
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-residence_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-residence_db}
       - DIRECT_DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-residence_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-residence_db}
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - REDIS_URL=${REDIS_URL:?REDIS_URL must be set in .env (Upstash rediss:// URL)}
       - SKIP_MIGRATIONS=1
     healthcheck:
       test: [ "CMD", "python3", "-c", "import sys; sys.exit(0)" ]
@@ -123,14 +78,9 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      pgbouncer:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
 
 volumes:
   postgres_prod_data:
-  redis_prod_data:
 
 networks:
   residence_internal:

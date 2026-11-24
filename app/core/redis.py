@@ -38,8 +38,9 @@ def get_redis_client() -> Optional[Any]:
                 settings.REDIS_URL,
                 encoding="utf-8",
                 decode_responses=True,
-                socket_timeout=1.5,
-                socket_connect_timeout=1.5
+                # Remote Redis (Upstash) needs more headroom for TLS handshakes.
+                socket_timeout=3.0,
+                socket_connect_timeout=3.0
             )
             _redis_loop = current_loop
         except Exception as e:
