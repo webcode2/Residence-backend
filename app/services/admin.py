@@ -344,12 +344,15 @@ async def get_global_access_logs(
     db: AsyncSession,
     limit: int = 50,
     offset: int = 0,
-    status_filter: Optional[str] = None
+    status_filter: Optional[str] = None,
+    app_id: Optional[str] = None,
 ) -> List[AccessLog]:
     """Query audit logs across all estates."""
-    query = select(AccessLog).order_by(AccessLog.created_at.desc()).offset(offset).limit(limit)
+    query = select(AccessLog).order_by(AccessLog.created_at.desc(), AccessLog.id.desc()).offset(offset).limit(limit)
     if status_filter:
         query = query.where(AccessLog.status == status_filter)
+    if app_id:
+        query = query.where(AccessLog.app_id == app_id)
 
     results = await db.execute(query)
     return list(results.scalars().all())

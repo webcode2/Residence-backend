@@ -110,3 +110,21 @@ async def test_visitor_access_push_is_tenant_scoped(db_session, estate_users):
         await _notify_visitor_access(db_session,estate_users[1][0].app_id,result)
         await asyncio.sleep(0)
         assert send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_generated_passcodes_stay_private_to_the_resident(client, estate_users, guard_headers):
+    estate, users = estate_users[0]
+    resident = headers(estate,users['resident'])
+    waiting = (await client.post('/api/v1/tokens/visitor',headers=resident,json={'visitor_name':'Not here yet'})).json()
+    arrived = (await client.post('/api/v1/tokens/visitor',headers=resident,json={'visitor_name':'At the gate'})).json()
+    await set_token_live_status(arrived['id'],'checked_in',extra={'checked_in_at':'2026-10-22T12:00:00'})
+    own = (await client.get('/api/v1/tokens/visitor/history',headers=resident)).json()
+    assert {p['id'] for p in own} == {waiting['id'],arrived['id']} and all(p['code'] for p in own)
+    for staff in (await guard_headers(estate.app_id), headers(estate,users['caretaker'])):
+        seen = (await client.get('/api/v1/tokens/visitor/history',headers=staff)).json()
+        # Staff see visitors who actually came through the gate, never pending passcodes or codes.
+        assert [p['id'] for p in seen] == [arrived['id']]
+        assert seen[0]['code'] == '' and seen[0]['bookout_code'] is None
+        roster = (await client.get('/api/v1/tokens/visitor/active',headers=staff)).json()
+        assert [p['id'] for p in roster] == [arrived['id']] and roster[0]['code'] == ''

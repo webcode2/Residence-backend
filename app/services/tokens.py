@@ -437,5 +437,6 @@ async def get_active_visitors(db: AsyncSession, app_id: str) -> list:
             if live.get('checked_in_at'):
                 item.checked_in_at = datetime.fromisoformat(live['checked_in_at'])
         if item.status == 'checked_in':
+            item.code, item.bookout_code = '', None  # Staff roster: codes stay private to the resident.
             active.append(item)
     return active

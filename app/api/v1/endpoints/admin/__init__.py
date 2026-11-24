@@ -5,6 +5,7 @@ from app.api.v1.endpoints.admin.estates import router as estates_router
 from app.api.v1.endpoints.admin.subscriptions import router as subscriptions_router
 from app.api.v1.endpoints.admin.users import router as users_router
 from app.api.v1.endpoints.admin.access_logs import router as access_logs_router
+from app.api.v1.endpoints.admin.sales_inquiries import router as sales_inquiries_router
 
 from app.api.v1.endpoints.admin.audit import router as audit_router
 
@@ -18,5 +19,6 @@ admin_router.include_router(estates_router, prefix="/estates")
 admin_router.include_router(subscriptions_router, prefix="/subscriptions")
 admin_router.include_router(users_router, prefix="/users")
 admin_router.include_router(access_logs_router, prefix="/access-logs")
+admin_router.include_router(sales_inquiries_router, prefix="/sales-inquiries")
 
 __all__ = ["admin_router"]

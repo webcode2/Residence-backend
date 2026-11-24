@@ -154,7 +154,8 @@ async def visitor_history(
     cutoff=utc_now()-timedelta(days=days)
     query = select(VisitorToken).where(VisitorToken.app_id == app_id,or_(
         VisitorToken.status=='checked_in',VisitorToken.expires_at>=cutoff,VisitorToken.checked_out_at>=cutoff))
-    if not {UserRole.SECURITY, UserRole.CARETAKER}.intersection(current_user.roles):
+    staff = bool({UserRole.SECURITY, UserRole.CARETAKER}.intersection(current_user.roles))
+    if not staff:
         query = query.where(VisitorToken.resident_id == current_user.id)
     rows = (await db.execute(query.order_by(VisitorToken.created_at.desc()).limit(200))).scalars().all()
     result = []
@@ -167,6 +168,12 @@ async def visitor_history(
                 if live.get(field):
                     from datetime import datetime
                     setattr(item, field, datetime.fromisoformat(live[field]))
+        if staff and row.resident_id != current_user.id:
+            # A generated passcode is private to the resident who made it: staff only see visitors
+            # who actually came through the gate, and never the entry or book-out codes.
+            if item.status == 'pending':
+                continue
+            item.code, item.bookout_code = '', None
         result.append(item)
     return result
 

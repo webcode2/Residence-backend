@@ -57,10 +57,10 @@ async def register_resident(db: AsyncSession, user_in: UserCreateSchema, registr
         return None
     host = (await db.execute(select(User).where(User.id == token.landlord_id,
         User.app_id == app_id, User.is_revoked.is_(False)))).scalar_one_or_none()
-    if not host or UserRole.LANDLORD not in host.roles or host.must_change_password:
+    if not host or UserRole.LANDLORD not in host.roles:
         return None
     # A public invitation must never change or relink an existing account.
-    if await get_user_by_email(db, str(user_in.email).lower()):
+    if await get_user_by_email(db, str(user_in.email).lower(), app_id):
         return None
     if len(user_in.password) < 12 or len(user_in.password.encode('utf-8')) > 72:
         from fastapi import HTTPException

@@ -19,7 +19,7 @@ if config.config_file_name is not None:
 # for 'autogenerate' support
 from app.models import plan, sos, onboarding, history
 from app.core.database import Base
-from app.models import estate, user, token, access_log, chat, admin_audit # import all models
+from app.models import estate, user, token, access_log, chat, admin_audit, community # import all models
 target_metadata = Base.metadata
 
 from app.core.config import settings

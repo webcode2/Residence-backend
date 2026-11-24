@@ -108,3 +108,14 @@ async def test_expired_checkout_can_be_replaced(db_session,pending,monkeypatch):
     result=await card_trials.start(db_session,'TRIAL-TEST',pending[1],request)
     assert result['session_id']=='chk_replacement'
     assert mock.call_args_list[1].args[2]['product_cart'][0]['product_id']=='prod_trial'
+
+@pytest.mark.asyncio
+async def test_checkout_unknown_to_new_provider_account_is_recreated(db_session,pending,monkeypatch):
+    # After switching Bachs accounts the saved session and product no longer exist there.
+    _,_,request=await setup_card(db_session,pending,monkeypatch)
+    mock=AsyncMock(side_effect=[HTTPException(404,'missing'),{'id':'prod_new'},{'id':'chk_new','checkout_url':'https://sandbox-checkout.bachs.io/c/new'}])
+    monkeypatch.setattr(card_trials,'gateway',mock)
+    result=await card_trials.start(db_session,'TRIAL-TEST',pending[1],request)
+    assert result=={'checkout_url':'https://sandbox-checkout.bachs.io/c/new','session_id':'chk_new'}
+    row=await db_session.get(EstateCardTrial,'TRIAL-TEST')
+    assert row.product_id=='prod_new' and row.plan_snapshot['price_monthly']==15

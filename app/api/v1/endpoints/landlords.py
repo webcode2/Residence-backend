@@ -26,15 +26,119 @@ async def import_landlords(
     return await landlord_service.import_landlords(db, import_data, app_id)
 
 
+@router.post("/", status_code=status.HTTP_201_CREATED)
+async def create_landlord(
+    data: LandlordImportSchema,
+    app_id: str = Depends(validate_tenant),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(check_roles([UserRole.CARETAKER]))
+):
+    """
+    Directly create a single landlord in the estate directory without queueing.
+    Immediately creates the user account and active registration token.
+    """
+    from sqlalchemy import select
+    from app.models.user import User, UserRole
+    from app.models.token import RegistrationToken
+    from app.services.auth import get_password_hash
+    from app.services.tokens import generate_registration_code
+    from app.services.notifications import notification_service
+    from datetime import datetime, timedelta, UTC
+    import secrets
+    import asyncio
+
+    clean_email = str(data.email).strip().lower()
+    existing = (await db.execute(select(User.id).where(User.email == clean_email, User.app_id == app_id))).scalar_one_or_none()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This email already belongs to someone in your estate directory."
+        )
+
+    temp_password = secrets.token_urlsafe(14)
+    user = User(
+        email=clean_email,
+        full_name=data.name.strip(),
+        phone=data.phone.strip(),
+        house_number=data.house_number.strip(),
+        street_name=data.street_name.strip() if data.street_name else None,
+        app_id=app_id,
+        roles=[UserRole.LANDLORD],
+        must_change_password=True,
+        hashed_password=get_password_hash(temp_password)
+    )
+    db.add(user)
+    await db.flush()
+
+    token = RegistrationToken(
+        code=generate_registration_code(),
+        landlord_id=user.id,
+        house_number=user.house_number,
+        street_name=user.street_name,
+        relationship_type="family",
+        expires_at=datetime.now(UTC).replace(tzinfo=None) + timedelta(days=7),
+        app_id=app_id
+    )
+    db.add(token)
+    await db.commit()
+    await db.refresh(user)
+
+    from app.core.redis import cache_registration_token
+    try:
+        await cache_registration_token(
+            app_id=app_id,
+            code=token.code,
+            token_data={
+                "id": str(token.id),
+                "code": token.code,
+                "landlord_id": str(token.landlord_id),
+                "app_id": app_id,
+                "house_number": token.house_number,
+                "street_name": token.street_name
+            },
+            ttl_seconds=1200
+        )
+    except Exception:
+        pass
+
+    # Fire-and-forget welcome email if configured; do not block or fail creation
+    try:
+        asyncio.create_task(
+            notification_service.send_registration_email(
+                clean_email, temp_password, full_name=user.full_name, app_id=app_id
+            )
+        )
+    except Exception:
+        pass
+
+    return {
+        "id": str(user.id),
+        "full_name": user.full_name,
+        "email": user.email,
+        "phone": user.phone,
+        "house_number": user.house_number,
+        "street_name": user.street_name,
+        "registration_token": token.code,
+        "status": "active",
+        "type": "permanent",
+        "temporary_password": temp_password,
+        "message": "Landlord added successfully"
+    }
+
+
 @router.get('/')
 async def resident_directory(
     app_id: str = Depends(validate_tenant), db: AsyncSession = Depends(get_db),
     current_user = Depends(check_roles([UserRole.CARETAKER])),
 ):
     from sqlalchemy import select
-    from app.models.user import User
+    from app.models.user import User, UserRole
     from app.models.token import RegistrationToken
     from app.models.base import utc_now
+    from datetime import datetime, timedelta, UTC
+    from app.services.tokens import generate_registration_code
+    from app.core.redis import cache_registration_token
+
     users = (await db.execute(select(User).where(User.app_id == app_id).order_by(User.full_name, User.id))).scalars().all()
     tokens = (await db.execute(select(RegistrationToken).where(
         RegistrationToken.app_id == app_id, RegistrationToken.is_used.is_(False), RegistrationToken.is_revoked.is_(False),
@@ -43,6 +147,47 @@ async def resident_directory(
     latest = {}
     for token in tokens:
         latest.setdefault(token.landlord_id, token.code)
+
+    # Ensure every landlord in the directory has an active registration token
+    now_utc = datetime.now(UTC).replace(tzinfo=None)
+    new_tokens = []
+    landlords = [u for u in users if (UserRole.LANDLORD in u.roles) and u.landlord_id is None]
+    for lld in landlords:
+        if lld.id not in latest:
+            code = generate_registration_code()
+            new_tok = RegistrationToken(
+                code=code,
+                landlord_id=lld.id,
+                house_number=lld.house_number,
+                street_name=lld.street_name,
+                relationship_type="family",
+                expires_at=now_utc + timedelta(days=7),
+                app_id=app_id
+            )
+            db.add(new_tok)
+            new_tokens.append(new_tok)
+            latest[lld.id] = code
+
+    if new_tokens:
+        await db.commit()
+        for tok in new_tokens:
+            try:
+                await cache_registration_token(
+                    app_id=app_id,
+                    code=tok.code,
+                    token_data={
+                        "id": str(tok.id),
+                        "code": tok.code,
+                        "landlord_id": str(tok.landlord_id),
+                        "app_id": app_id,
+                        "house_number": tok.house_number,
+                        "street_name": tok.street_name
+                    },
+                    ttl_seconds=1200
+                )
+            except Exception:
+                pass
+
     return [{
         'id': user.id, 'full_name': user.full_name or user.email, 'email': user.email,
         'phone': user.phone, 'must_change_password': user.must_change_password, 'landlord_id': user.landlord_id,
@@ -79,15 +224,35 @@ async def import_landlord_file(file: UploadFile = File(...), app_id: str = Depen
 
 @router.get('/onboarding-jobs')
 async def onboarding_jobs(app_id: str = Depends(validate_tenant), db: AsyncSession = Depends(get_db),
-    current_user = Depends(check_roles([UserRole.CARETAKER])), offset: int = 0):
+    current_user = Depends(check_roles([UserRole.CARETAKER])), offset: int = 0,
+    batch_id: uuid.UUID | None = None, problems: bool = False):
     from sqlalchemy import select
     from app.models.onboarding import LandlordOnboardingJob as Job
     if offset < 0:
         raise HTTPException(422, 'Invalid page offset')
-    jobs = (await db.execute(select(Job).where(Job.app_id == app_id).order_by(Job.created_at.desc(), Job.id).offset(offset).limit(100))).scalars().all()
+    query = select(Job).where(Job.app_id == app_id)
+    if batch_id:
+        query = query.where(Job.batch_id == batch_id)
+    if problems:
+        query = query.where(Job.status.in_(['failed', 'retrying', 'skipped']))
+    # A batch holds at most one file's rows, so its problem list needs no paging.
+    limit = 500 if batch_id else 100
+    jobs = (await db.execute(query.order_by(Job.created_at.desc(), Job.id).offset(offset).limit(limit))).scalars().all()
     return [dict(id=str(j.id), batch_id=str(j.batch_id), email=j.email, full_name=j.full_name,
         phone=j.phone, house_number=j.house_number, status=j.status, attempts=j.attempts,
         last_error=j.last_error, next_attempt_at=j.next_attempt_at, created_at=j.created_at) for j in jobs]
+
+@router.get('/import-batches')
+async def import_batches(app_id: str = Depends(validate_tenant), db: AsyncSession = Depends(get_db),
+    current_user = Depends(check_roles([UserRole.CARETAKER])), offset: int = 0):
+    if offset < 0:
+        raise HTTPException(422, 'Invalid page offset')
+    return await landlord_service.list_batches(db, app_id, offset)
+
+@router.post('/import-batches/{batch_id}/retry')
+async def retry_import_batch(batch_id: uuid.UUID, app_id: str = Depends(validate_tenant),
+    db: AsyncSession = Depends(get_db), current_user = Depends(check_roles([UserRole.CARETAKER]))):
+    return await landlord_service.retry_batch(db, app_id, batch_id)
 
 @router.post('/onboarding-jobs/{job_id}/retry')
 async def retry_onboarding_job(job_id: uuid.UUID, app_id: str = Depends(validate_tenant),

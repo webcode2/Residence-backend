@@ -166,3 +166,22 @@ async def test_saas_admin_full_workflow(client, db_session):
     # Token immediately blacklisted in Redis
     blacklisted_resp = await client.get("/api/v1/admin/overview", headers=new_admin_headers)
     assert blacklisted_resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_platform_access_feed_filters_by_estate_and_result(client, db_session):
+    from app.dependencies import get_current_saas_admin
+    from app.main import app
+    from app.models.access_log import AccessLog
+    for tenant, result in [('FEED-ONE', 'authorized'), ('FEED-ONE', 'denied'), ('FEED-TWO', 'denied')]:
+        db_session.add(AccessLog(app_id=tenant, event_type='rfid_verification', identifier='tag', status=result))
+    await db_session.commit()
+    app.dependency_overrides[get_current_saas_admin] = lambda: User(email='owner@feed.example', roles=[UserRole.SAAS_OWNER], app_id='GLOBAL')
+    try:
+        one = (await client.get('/api/v1/admin/access-logs', params={'app_id': 'FEED-ONE'})).json()
+        assert {log['app_id'] for log in one} == {'FEED-ONE'} and len(one) == 2
+        denied = (await client.get('/api/v1/admin/access-logs', params={'app_id': 'FEED-ONE', 'status': 'denied'})).json()
+        assert [log['status'] for log in denied] == ['denied']
+        assert (await client.get('/api/v1/admin/access-logs', params={'status': 'maybe'})).status_code == 422
+    finally:
+        app.dependency_overrides.pop(get_current_saas_admin, None)

@@ -284,3 +284,94 @@ async def test_headerless_registration_preserves_invitation_checks(client, db_se
         headers={'X-App-Id': 'FORGED'} if invalid == 'wrong_header' else {},
         json={'email': uuid.uuid4().hex+'@example.com', 'password': 'private-household-password'})
     assert result.status_code == 400, result.text
+
+SEND='app.services.landlords.notification_service.send_registration_email'
+
+async def batch_of(client,headers,batch_id):
+    batches=(await client.get('/api/v1/landlords/import-batches',headers=headers)).json()
+    return next(b for b in batches if b['batch_id']==batch_id)
+
+async def set_status(db_session,email,**fields):
+    job=(await db_session.execute(select(Job).where(Job.email==email))).scalar_one()
+    for name,value in fields.items():setattr(job,name,value)
+    await db_session.commit()
+    return job
+
+@pytest.mark.asyncio
+async def test_batch_reports_status_progress_and_result(client,db_session,onboarding_estate):
+    app_id,headers=onboarding_estate;existing,first,second=row(),row(),row()
+    db_session.add(User(email=existing['email'],hashed_password='unused',app_id=app_id,roles=[UserRole.RESIDENT]));await db_session.commit()
+    upload=f"Name,Email,Phone,House Number\nA,{existing['email']},+2348012345678,1\nB,{first['email']},+2348012345678,2\nC,{second['email']},+2348012345678,3\n".encode()
+    results=(await client.post('/api/v1/landlords/import-file',headers=headers,files={'file':('homes.csv',upload,'text/csv')})).json()
+    batch_id=results[0]['batch_id']
+    batch=await batch_of(client,headers,batch_id)
+    assert (batch['filename'],batch['status'],batch['total'],batch['completed'],batch['skipped'])==('homes.csv','processing',3,1,1)
+    with patch(SEND,new_callable=AsyncMock,return_value=True):
+        await process_one(db_session)
+    batch=await batch_of(client,headers,batch_id)
+    assert (batch['status'],batch['added'],batch['completed'])==('processing',1,2)
+    await set_status(db_session,second['email'],status='failed',last_error='Provider rejected the message')
+    batch=await batch_of(client,headers,batch_id)
+    assert (batch['status'],batch['failed'],batch['completed'])==('needs_attention',1,3)
+    issues=(await client.get('/api/v1/landlords/onboarding-jobs',headers=headers,params={'batch_id':batch_id,'problems':True})).json()
+    assert {j['email'] for j in issues}=={existing['email'],second['email']}
+
+@pytest.mark.asyncio
+async def test_batch_retry_continues_only_unfinished_rows(client,db_session,onboarding_estate):
+    app_id,headers=onboarding_estate;done,broken=row(),row()
+    results=(await client.post('/api/v1/landlords/import',headers=headers,json=[done,broken])).json();batch_id=results[0]['batch_id']
+    with patch(SEND,new_callable=AsyncMock,side_effect=[True,False]) as send:
+        await process_one(db_session);await process_one(db_session)
+        password=send.call_args.kwargs['password']
+    await set_status(db_session,broken['email'],status='failed',attempts=5)
+    db_session.add(Estate(name='Other estate',app_id='OTHER-'+app_id,is_active=True))
+    other=User(email=uuid.uuid4().hex+'@example.com',hashed_password='unused',app_id='OTHER-'+app_id,roles=[UserRole.CARETAKER]);db_session.add(other);await db_session.commit()
+    foreign={'X-App-Id':other.app_id,'Authorization':'Bearer '+create_access_token({'sub':other.email,'app_id':other.app_id})}
+    assert (await client.post(f'/api/v1/landlords/import-batches/{batch_id}/retry',headers=foreign)).status_code==404
+    retried=await client.post(f'/api/v1/landlords/import-batches/{batch_id}/retry',headers=headers)
+    assert retried.status_code==200 and retried.json()['requeued']==1
+    with patch(SEND,new_callable=AsyncMock,return_value=True) as send:
+        assert await process_one(db_session)
+        assert not await process_one(db_session)
+    assert send.call_count==1 and send.call_args.kwargs['email']==broken['email'] and send.call_args.kwargs['password']==password
+    batch=await batch_of(client,headers,batch_id)
+    assert (batch['status'],batch['added'],batch['failed'])==('completed',2,0)
+    assert (await client.post(f'/api/v1/landlords/import-batches/{batch_id}/retry',headers=headers)).status_code==409
+
+@pytest.mark.asyncio
+async def test_reupload_continues_failed_rows_with_corrected_details(client,db_session,onboarding_estate):
+    _,headers=onboarding_estate;done,broken=row(),row()
+    await client.post('/api/v1/landlords/import',headers=headers,json=[done,broken])
+    with patch(SEND,new_callable=AsyncMock,return_value=True):
+        await process_one(db_session)
+    await set_status(db_session,broken['email'],status='failed',attempts=5,last_error='Provider rejected the message')
+    upload=f"Name,Email,Phone,House Number\nA,{done['email']},+2348012345678,1\nB,{broken['email']},+2348099999999,9\n".encode()
+    results=(await client.post('/api/v1/landlords/import-file',headers=headers,files={'file':('fixed.csv',upload,'text/csv')})).json()
+    assert [r['status'] for r in results]==['skipped','requeued']
+    db_session.expire_all()
+    job=(await db_session.execute(select(Job).where(Job.email==broken['email']))).scalar_one()
+    assert (job.status,job.attempts,job.phone,job.house_number,job.last_error)==('queued',0,'+2348099999999','9',None)
+    batch=await batch_of(client,headers,results[1]['batch_id'])
+    assert (batch['filename'],batch['total'],batch['status'])==('fixed.csv',1,'processing')
+
+@pytest.mark.asyncio
+async def test_interrupted_import_resumes_without_repeating_finished_rows(client,db_session,onboarding_estate):
+    _,headers=onboarding_estate;done,interrupted,waiting=row(),row(),row()
+    batch_id=(await client.post('/api/v1/landlords/import',headers=headers,json=[done,interrupted,waiting])).json()[0]['batch_id']
+    with patch(SEND,new_callable=AsyncMock,return_value=True):
+        await process_one(db_session)
+    await set_status(db_session,interrupted['email'],status='processing',attempts=1,lease_until=utc_now()-timedelta(seconds=1))
+    with patch(SEND,new_callable=AsyncMock,return_value=True) as send:
+        while await process_one(db_session):pass
+    assert sorted(c.kwargs['email'] for c in send.call_args_list)==sorted([interrupted['email'],waiting['email']])
+    batch=await batch_of(client,headers,batch_id)
+    assert (batch['status'],batch['added'],batch['completed'])==('completed',3,3)
+
+@pytest.mark.asyncio
+async def test_missing_email_setup_is_reported_plainly(client,db_session,onboarding_estate):
+    _,headers=onboarding_estate;entry=row()
+    await client.post('/api/v1/landlords/import',headers=headers,json=[entry])
+    with patch('app.services.landlords.notification_service.api_key',''):
+        assert await process_one(db_session)
+    job=(await db_session.execute(select(Job).where(Job.email==entry['email']))).scalar_one()
+    assert job.status=='retrying' and 'not set up' in job.last_error

@@ -105,17 +105,20 @@ async def test_removing_chat_account_revokes_instead_of_deleting_history():
 async def test_overview_uses_authenticated_estate_for_every_query():
     from app.api.v1.endpoints.dashboard import estate_overview
     db = AsyncMock()
-    summary, daily, activity = MagicMock(), MagicMock(), MagicMock()
+    summary, daily, generated, activity = MagicMock(), MagicMock(), MagicMock(), MagicMock()
     summary.mappings.return_value.one.return_value = {
         'residents': 3, 'active_gates': 2, 'open_conversations': 1, 'emergencies': 0,
     }
     daily.all.return_value = []
+    from app.models.base import utc_now
+    generated.all.return_value = [MagicMock(day=utc_now().date(), total=4)]
     activity.scalars.return_value.all.return_value = []
-    db.execute.side_effect = [summary, daily, activity]
+    db.execute.side_effect = [summary, daily, generated, activity]
     with patch('app.api.v1.endpoints.dashboard.list_audit_threads', AsyncMock(return_value=([], False))):
         result = await estate_overview(db, caretaker())
     assert result['residents'] == 3
     assert len(result['gate_activity']) == 7
+    assert [d['generated'] for d in result['gate_activity']] == [0] * 6 + [4]
     assert result['recent_activity'] == []
     for call in db.execute.call_args_list:
         assert 'ESTATE-A' in call.args[0].compile().params.values()

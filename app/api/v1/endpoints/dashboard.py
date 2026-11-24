@@ -9,6 +9,7 @@ from app.models.base import utc_now
 from app.models.user import User, UserRole
 from app.models.chat import ChatThread, GateSite
 from app.models.access_log import AccessLog
+from app.models.token import VisitorToken
 from app.services.chat import list_audit_threads, thread_to_schema
 
 router = APIRouter()
@@ -36,6 +37,12 @@ async def estate_overview(
     ).where(AccessLog.app_id == aid, AccessLog.created_at >= start)
       .group_by(func.date(AccessLog.created_at), AccessLog.status))).all()
     counts = {(str(row.day), row.status): row.total for row in daily}
+    # Visitor passcodes residents generated, per day, alongside gate outcomes.
+    generated = (await db.execute(select(
+        func.date(VisitorToken.created_at).label('day'), func.count().label('total')
+    ).where(VisitorToken.app_id == aid, VisitorToken.created_at >= start)
+      .group_by(func.date(VisitorToken.created_at)))).all()
+    counts.update({(str(row.day), 'generated'): row.total for row in generated})
     activity = (await db.execute(select(AccessLog).where(AccessLog.app_id == aid)
         .order_by(AccessLog.created_at.desc(), AccessLog.id.desc()).limit(6))).scalars().all()
     return {
@@ -43,7 +50,8 @@ async def estate_overview(
         'gate_activity': [
             {'date': (start + timedelta(days=i)).isoformat(),
              'authorized': counts.get(((start + timedelta(days=i)).isoformat(), 'authorized'), 0),
-             'denied': counts.get(((start + timedelta(days=i)).isoformat(), 'denied'), 0)}
+             'denied': counts.get(((start + timedelta(days=i)).isoformat(), 'denied'), 0),
+             'generated': counts.get(((start + timedelta(days=i)).isoformat(), 'generated'), 0)}
             for i in range(7)
         ],
         'recent_activity': [{'id': str(log.id), 'status': log.status,

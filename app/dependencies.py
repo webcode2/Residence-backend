@@ -268,7 +268,7 @@ async def get_current_saas_admin(
         )
 
     # Fetch user from DB
-    result = await db.execute(select(User).where(User.email == email))
+    result = await db.execute(select(User).where(User.email == email, User.roles.contains([UserRole.SAAS_OWNER])))
     user = result.scalar_one_or_none()
     if user is None:
         raise credentials_exception

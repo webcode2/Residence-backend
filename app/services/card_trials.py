@@ -27,6 +27,8 @@ async def gateway(method, path, body=None, key=None):
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.request(method, settings.BACHS_BASE_URL.rstrip('/') + '/v1/' + path,
                                      json=body, headers=headers)
+            if r.status_code == 404:
+                raise HTTPException(404, 'The card provider has no record of this checkout.')
             r.raise_for_status()
             data = r.json()
             return data.get('data', data)
@@ -51,7 +53,13 @@ async def start(db, app_id, user, request):
         raise HTTPException(409, 'This estate has already been activated. A second free trial is unavailable.')
     previous_session = None
     if row and row.session_id:
-        existing = await gateway('GET', 'checkout-sessions/' + row.session_id)
+        try:
+            existing = await gateway('GET', 'checkout-sessions/' + row.session_id)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            # Unknown to the configured Bachs account (keys switched): its product is gone too.
+            existing, row.product_id = {'status': 'expired'}, None
         if existing.get('status') not in ('expired', 'cancelled'):
             return {'checkout_url': row.checkout_url, 'session_id': row.session_id}
         previous_session = row.session_id

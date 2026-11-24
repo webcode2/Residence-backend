@@ -753,7 +753,7 @@ async def record_login_failure(
 ) -> Tuple[int, bool, int]:
     """
     Records a failed login attempt.
-    If failures exceed max_failures within window_seconds, sets temporary block for block_seconds.
+    When failures reach max_failures within window_seconds, sets a temporary block for block_seconds.
     Returns (current_failures, is_blocked, remaining_seconds).
     """
     client = get_redis_client()

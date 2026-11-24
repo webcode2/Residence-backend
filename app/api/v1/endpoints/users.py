@@ -49,13 +49,7 @@ async def create_app_admin_account(
     Unified registration for new Estates and their first Admin user.
     Creates Estate, Active Subscription, and Caretaker Account.
     """
-    existing_user = await user_service.get_user_by_email(db, reg_in.email)
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="A user with this email already exists"
-        )
-    
+    # Accounts are unique per estate; a brand-new estate has none, so the same person may run several estates.
     return await estate_service.register_new_estate(db, reg_in)
 
 @router.post("/", response_model=UserSchema, tags=["users"])
@@ -79,6 +73,42 @@ async def create_user(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="User with this email already exists in this tenant"
         )
+    
+    # Create active registration token alongside user creation
+    if UserRole.LANDLORD in user.roles or UserRole.RESIDENT in user.roles:
+        from app.models.token import RegistrationToken
+        from app.services.tokens import generate_registration_code
+        from app.core.redis import cache_registration_token
+        from datetime import datetime, timedelta, UTC
+
+        token = RegistrationToken(
+            code=generate_registration_code(),
+            landlord_id=user.landlord_id or user.id,
+            house_number=user.house_number,
+            street_name=user.street_name,
+            relationship_type="family",
+            expires_at=datetime.now(UTC).replace(tzinfo=None) + timedelta(days=7),
+            app_id=app_id
+        )
+        db.add(token)
+        await db.commit()
+        try:
+            await cache_registration_token(
+                app_id=app_id,
+                code=token.code,
+                token_data={
+                    "id": str(token.id),
+                    "code": token.code,
+                    "landlord_id": str(token.landlord_id),
+                    "app_id": app_id,
+                    "house_number": token.house_number,
+                    "street_name": token.street_name
+                },
+                ttl_seconds=1200
+            )
+        except Exception:
+            pass
+
     return user
 
 # Register resident using registration code

@@ -47,7 +47,7 @@ async def admin_login(
             detail=f"Too many failed admin login attempts. Please try again in {remaining} seconds."
         )
 
-    result = await db.execute(select(User).where(User.email == login_in.email))
+    result = await db.execute(select(User).where(User.email == login_in.email, User.roles.contains([UserRole.SAAS_OWNER])))
     user = result.scalar_one_or_none()
 
     if not user or not verify_saas_admin_password(login_in.password, user.hashed_password):

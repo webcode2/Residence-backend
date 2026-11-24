@@ -26,7 +26,7 @@ async def update_profile(db, current_user, profile, token):
     if new_email != old_email:
         if not profile.current_password or len(profile.current_password.encode("utf-8"))>72 or not verify_password(profile.current_password, user.hashed_password):
             raise HTTPException(400, 'Enter your current password to change your email')
-        exists = await db.scalar(select(User.id).where(User.email == new_email, User.id != user.id))
+        exists = await db.scalar(select(User.id).where(User.email == new_email, User.app_id == user.app_id, User.id != user.id))
         if exists:
             raise HTTPException(409, 'This email address is already in use')
         changes['email'] = new_email

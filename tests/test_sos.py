@@ -165,7 +165,10 @@ def test_live_push_expires_at_original_deadline_and_reports_use_normal_channel()
     data={'type':'sos_live','alert_id':'test','alarm_expires_at':(now+timedelta(seconds=12)).isoformat()}
     message=sos.fcm_service._build_message('phone','SOS','Help',data,True)['message']
     assert 0<=int(message['android']['ttl'][:-1])<=12
-    assert message['android']['notification']['channel_id']=='residence_sos_live_v2'
+    # Data-only on Android so the app's own receiver rings like an incoming call, even when closed.
+    assert 'notification' not in message and 'notification' not in message['android']
+    assert message['data']['title']=='SOS' and message['data']['body']=='Help'
+    assert message['apns']['payload']['aps']['alert']=={'title':'SOS','body':'Help'}
     assert message['apns']['headers']['apns-expiration']==str(int((now+timedelta(seconds=12)).timestamp()))
     data['alarm_expires_at']=(now-timedelta(seconds=1)).isoformat()
     late=sos.fcm_service._build_message('phone','SOS','Help',data,True)['message']

@@ -201,3 +201,8 @@ app.include_router(sos.router, prefix=f"{settings.API_V1_STR}/sos", tags=["estat
 
 from app.api.v1.endpoints import notification_inbox
 app.include_router(notification_inbox.router, prefix=f"{settings.API_V1_STR}/notifications", tags=["notifications"])
+
+from app.api.v1.endpoints import community
+app.include_router(community.reports_router, prefix=f"{settings.API_V1_STR}/reports", tags=["incident_reports"])
+app.include_router(community.announcements_router, prefix=f"{settings.API_V1_STR}/announcements", tags=["announcements"])
+app.include_router(community.sales_router, prefix=f"{settings.API_V1_STR}/sales-inquiries", tags=["sales"])

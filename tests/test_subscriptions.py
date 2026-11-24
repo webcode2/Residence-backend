@@ -43,7 +43,7 @@ async def test_list_tiers(client):
     assert tier_map["enterprise"]["realtime_alerts_enabled"] is True
 
 @pytest.mark.asyncio
-async def test_rfid_disabled_on_starter_tier(client, db_session):
+async def test_rfid_disabled_on_starter_tier(client, db_session, guard_headers):
     estate_id = uuid.uuid4()
     app_id = f"RP-{estate_id.hex[:5].upper()}"
     estate = Estate(id=estate_id, app_id=app_id, name="Starter Estate")
@@ -73,14 +73,14 @@ async def test_rfid_disabled_on_starter_tier(client, db_session):
     db_session.add(resident)
     await db_session.commit()
 
-    # Attempt to scan RFID tag on Starter plan ($15/mo)
-    headers = {"X-App-Id": app_id}
+    # Attempt to scan RFID tag on Starter plan ($15/mo); verification requires a signed-in guard.
+    headers = await guard_headers(app_id)
     response = await client.get("/api/v1/verify/rfid/RFID_STARTER_1", headers=headers)
     assert response.status_code == 403
     assert "RFID access is not supported on your current tier" in response.json()["detail"]
 
 @pytest.mark.asyncio
-async def test_verification_quota_limit_enforced(client, db_session):
+async def test_verification_quota_limit_enforced(client, db_session, guard_headers):
     estate_id = uuid.uuid4()
     app_id = f"RP-{estate_id.hex[:5].upper()}"
     estate = Estate(id=estate_id, app_id=app_id, name="Quota Estate")
@@ -104,7 +104,7 @@ async def test_verification_quota_limit_enforced(client, db_session):
     await increment_monthly_quota_redis(app_id, 2)
     await increment_monthly_quota_redis(app_id, 2)
 
-    headers = {"X-App-Id": app_id}
+    headers = await guard_headers(app_id)
     response = await client.get("/api/v1/verify/token/9999", headers=headers)
     assert response.status_code == 403
     assert "Monthly verification quota" in response.json()["detail"]

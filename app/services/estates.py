@@ -89,13 +89,6 @@ async def register_new_estate(db: AsyncSession, reg_in: EstateRegistrationReques
     db.add(new_subscription)
     
     # 4. Create Admin (Caretaker) User
-    existing_user = await db.execute(select(User).where(User.email == reg_in.email))
-    if existing_user.scalar_one_or_none():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="A user with this email already exists"
-        )
-    
     admin_user = User(
         email=reg_in.email,
         full_name=reg_in.adminName,

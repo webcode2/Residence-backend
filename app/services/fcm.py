@@ -158,6 +158,14 @@ class FCMService:
                 if kind != 'sos_missed':
                     body = f"{str_data.get('sender_name', 'An estate member')} reported an SOS at {str_data.get('house_location', 'their home')} ({str_data.get('created_at', 'time unavailable')}). Status: {str_data.get('status', 'unknown')}."
             remaining = max(0, min(LIVE_DELIVERY_SECONDS, int(expiry-time.time()))) if live else 2419200
+            if live:
+                # Android gets data only: the app's receiver posts a looping, full-screen ringing alert
+                # (a notification payload would be shown once by the system and never ring when closed).
+                return {'message': {'token': token, 'data': {**str_data, 'title': title, 'body': body},
+                    'android': {'priority': 'HIGH', 'ttl': f'{remaining}s'},
+                    'apns': {'headers': {'apns-priority': '10', 'apns-expiration': str(int(expiry))},
+                        'payload': {'aps': {'alert': {'title': title, 'body': body}, 'sound': 'sos_alarm.wav', 'content-available': 1,
+                            **({'badge': int(data['notification_count'])} if data.get('notification_count') is not None else {})}}}}}
             return {'message': {'token': token, 'notification': {'title': title, 'body': body}, 'data': str_data,
                 'android': {'priority': 'HIGH', 'ttl': f'{remaining}s', 'notification': {
                     'channel_id': 'residence_sos_live_v2' if live else 'residence_sos_reports_v1',

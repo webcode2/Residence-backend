@@ -15,7 +15,8 @@ class UserRole(str, enum.Enum):
 class User(Base, ModelMixin, TenantMixin):
     __tablename__ = "users"
     
-    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    # Unique per estate (see ix_users_app_id_email): one person may belong to several estates.
+    email: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
     full_name: Mapped[str] = mapped_column(String(255), nullable=True)
     phone: Mapped[str] = mapped_column(String(40), nullable=True)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
@@ -40,7 +41,7 @@ class User(Base, ModelMixin, TenantMixin):
 
     __table_args__ = (
         Index("ix_users_app_id_rfid_tag", "app_id", "rfid_tag"),
-        Index("ix_users_app_id_email", "app_id", "email"),
+        Index("ix_users_app_id_email", "app_id", "email", unique=True),
     )
 
 

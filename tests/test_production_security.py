@@ -47,26 +47,32 @@ async def test_cors_headers_present(client):
 
 @pytest.mark.asyncio
 async def test_tenant_login_rate_limiting(client, db_session):
-    # Repeated failed attempts should trigger rate limit (429)
-    app_id = "RP-SECURITY-TEST"
+    # The estate must exist: unknown App IDs are rejected by tenant validation before the limiter runs.
+    from app.models.estate import Estate
+    app_id = f"RP-SEC-{uuid.uuid4().hex[:6].upper()}"
+    db_session.add(Estate(app_id=app_id, name="Security Test Estate", is_active=True))
+    await db_session.commit()
     email = "attacker@malicious.com"
 
-    for _ in range(5):
-        fail_resp = await client.post(
+    async def attempt():
+        return await client.post(
             "/api/v1/auth/login",
             json={"email": email, "password": "wrong_password"},
             headers={"X-App-Id": app_id}
         )
-        assert fail_resp.status_code == 401
 
-    # 6th attempt must be blocked by rate limiter
-    blocked_resp = await client.post(
-        "/api/v1/auth/login",
-        json={"email": email, "password": "wrong_password"},
-        headers={"X-App-Id": app_id}
-    )
+    for _ in range(4):
+        assert (await attempt()).status_code == 401
+
+    # The 5th failure starts the cooldown and is answered with 429.
+    locked = await attempt()
+    assert locked.status_code == 429
+    assert "Too many failed login attempts" in locked.json()["detail"]
+
+    # Further attempts are refused before any password check.
+    blocked_resp = await attempt()
     assert blocked_resp.status_code == 429
-    assert "Too many failed login attempts" in blocked_resp.json()["detail"]
+    assert "Please try again in" in blocked_resp.json()["detail"]
 
 @pytest.mark.asyncio
 async def test_visitor_token_creation_rate_limiting(client, db_session):

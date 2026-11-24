@@ -1,0 +1,40 @@
+#cloud-config
+# Residence server bootstrap for Oracle Always Free (Ubuntu 24.04, ARM/aarch64).
+# Upload in the instance "Initialization script" step. Installs Docker and basic
+# hardening only; the app, tunnel and backups are deployed afterwards over SSH.
+
+package_update: true
+package_upgrade: true
+packages:
+  - docker.io
+  - docker-compose-v2
+  - unattended-upgrades
+  - fail2ban
+  - postgresql-client
+  - git
+
+# 2 GB swap so image builds don't run out of memory.
+swap:
+  filename: /swapfile
+  size: 2147483648
+
+write_files:
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+  - path: /etc/ssh/sshd_config.d/90-residence.conf
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin no
+  - path: /etc/docker/daemon.json
+    content: |
+      {"log-driver": "json-file", "log-opts": {"max-size": "10m", "max-file": "5"}}
+
+runcmd:
+  - systemctl enable --now docker fail2ban
+  - usermod -aG docker ubuntu
+  - systemctl restart ssh
+  - mkdir -p /opt/residence /var/backups/residence
+  - chown ubuntu:ubuntu /opt/residence /var/backups/residence
+  - timedatectl set-timezone UTC
