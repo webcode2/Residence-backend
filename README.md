@@ -78,7 +78,7 @@ cp .env.example .env
 # Fill in DATABASE_URL, REDIS_URL (Upstash), RESEND credentials, and BACHS API keys
 ```
 
-> **MVP architecture (`mvp` branch):** PostgreSQL is used directly — no PgBouncer container — and Redis is remote via Upstash. Set `REDIS_URL` to the `rediss://` URL from the Upstash dashboard before starting the stack:
+> **MVP architecture (`mvp` branch):** PostgreSQL is remote via Neon (`DB_URL`) and Redis is remote via Upstash (`REDIS_URL`). There are no local Postgres, PgBouncer, or Redis containers. Set both URLs in `.env` before starting the stack:
 > ```bash
 > docker compose -f docker-compose.prod.yml up -d --build
 > ```

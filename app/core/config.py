@@ -36,7 +36,9 @@ class Settings(BaseSettings):
     POSTGRES_USER: str = "postgres"
     POSTGRES_PASSWORD: str = "postgres"
     POSTGRES_DB: str = "residence_db"
-    # App traffic (prefer PgBouncer in production). Migrations use DIRECT_DATABASE_URL.
+    # MVP: DB_URL points at the remote Neon PostgreSQL instance (no local DB container).
+    # DATABASE_URL is retained as a legacy alias; DIRECT_DATABASE_URL is for migrations.
+    DB_URL: str | None = None
     DATABASE_URL: str | None = None
     DIRECT_DATABASE_URL: str | None = None
     DB_USE_PGBOUNCER: bool = False
@@ -90,17 +92,23 @@ class Settings(BaseSettings):
             return v_clean in ("true", "1", "yes", "t", "on")
         return bool(v)
 
+    def _as_asyncpg_url(url: str) -> str:
+        return url.replace("postgresql://", "postgresql+asyncpg://").replace(
+            "postgres://", "postgresql+asyncpg://"
+        )
+
     @property
     def async_database_url(self) -> str:
-        if self.DATABASE_URL:
-            return self.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
+        url = self.DB_URL or self.DATABASE_URL
+        if url:
+            return self._as_asyncpg_url(url)
         return f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}/{self.POSTGRES_DB}"
 
     @property
     def async_direct_database_url(self) -> str:
-        """Direct Postgres URL for Alembic / admin ops (bypass PgBouncer)."""
+        """Direct Postgres URL for Alembic / admin ops (falls back to DB_URL on the MVP)."""
         if self.DIRECT_DATABASE_URL:
-            return self.DIRECT_DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
+            return self._as_asyncpg_url(self.DIRECT_DATABASE_URL)
         return self.async_database_url
 
     @model_validator(mode="after")

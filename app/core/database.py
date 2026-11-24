@@ -5,7 +5,8 @@ from app.core.config import settings
 # PgBouncer (transaction pooling) cannot reuse prepared statements across clients.
 # Disable asyncpg statement cache whenever we talk through a pooler.
 _connect_args: dict = {}
-if settings.DB_USE_PGBOUNCER or "pgbouncer" in (settings.DATABASE_URL or "").lower():
+_configured_db_url = (settings.DB_URL or settings.DATABASE_URL or "").lower()
+if settings.DB_USE_PGBOUNCER or "pgbouncer" in _configured_db_url:
     _connect_args["statement_cache_size"] = 0
 
 engine = create_async_engine(

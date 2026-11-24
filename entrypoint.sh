@@ -41,7 +41,8 @@ async def wait_for_services():
         await direct_engine.dispose()
 
     # 2. Wait for PgBouncer when configured (app traffic path)
-    if settings.DB_USE_PGBOUNCER or "pgbouncer" in (settings.DATABASE_URL or "").lower():
+    configured_db_url = (settings.DB_URL or settings.DATABASE_URL or "").lower()
+    if settings.DB_USE_PGBOUNCER or "pgbouncer" in configured_db_url:
         print("[ENTRYPOINT] Connecting via PgBouncer...")
         pooler_engine = create_async_engine(
             app_url,
