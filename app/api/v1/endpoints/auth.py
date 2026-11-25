@@ -121,8 +121,7 @@ async def change_password(
     user = await db.get(User, current_user.id, populate_existing=True)
     if not user or not await auth_service.verify_password_async(body.current_password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
-    if len(body.new_password) < 12 or len(body.new_password.encode('utf-8')) > 72:
-        raise HTTPException(status_code=422, detail="Use at least 12 characters and no more than 72 UTF-8 bytes")
+    auth_service.require_acceptable_password(body.new_password)
     if await auth_service.verify_password_async(body.new_password, user.hashed_password):
         raise HTTPException(status_code=422, detail="Choose a different password")
     user.hashed_password = await auth_service.get_password_hash_async(body.new_password)

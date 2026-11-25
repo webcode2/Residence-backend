@@ -79,7 +79,7 @@ class AdminUserRevokeSchema(BaseModel):
 
 class AdminChangePasswordSchema(BaseModel):
     current_password: str
-    new_password: str = Field(..., min_length=8, max_length=72)
+    new_password: str = Field(..., min_length=8, max_length=72)  # keep in step with app.services.auth.PASSWORD_MIN_LENGTH
 
 class AdminProfileSchema(BaseModel):
     id: uuid.UUID

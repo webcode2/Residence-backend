@@ -132,7 +132,7 @@ Run the full test suite:
 
 `python seed.py` adds four clearly named demo estates and their role accounts, gates, conversations, visitor passes, and access history. It preserves existing data and does not reset existing passwords. A known legacy seed-owner hash using the former default password is repaired using the dedicated owner password hash. Re-running the script adds no duplicate records and does not reset subscriptions or conversation state.
 
-New passwords are generated securely and written to `.seed-credentials.json` with mode `0600`; passwords are not printed. Optional `SEED_OWNER_EMAIL` and `SEED_OWNER_PASSWORD` configure a new owner account. The password must contain at least 12 characters. Keep generated credential files private and out of Git.
+New passwords are generated securely and written to `.seed-credentials.json` with mode `0600`; passwords are not printed. Optional `SEED_OWNER_EMAIL` and `SEED_OWNER_PASSWORD` configure a new owner account. The password must contain at least 8 characters. Keep generated credential files private and out of Git.
 
 Apply `alembic upgrade head` before seeding to install the additive `admin_audit_logs` migration. Owner subscription, estate-status, and user-access changes write an audit event in the same database transaction as the change.
 

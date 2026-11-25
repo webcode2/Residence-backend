@@ -22,7 +22,7 @@ from app.services.auth import get_saas_admin_password_hash_async
 logger = logging.getLogger("owner_bootstrap")
 
 OWNER_APP_ID = "GLOBAL"  # matches seed.py; owner accounts are not tied to an estate
-OWNER_PASSWORD_MIN_LENGTH = 8  # also enforced by AdminChangePasswordSchema
+from app.services.auth import PASSWORD_MAX_BYTES, PASSWORD_MIN_LENGTH as OWNER_PASSWORD_MIN_LENGTH  # shared rule
 
 
 async def ensure_platform_owner(db, email: str | None = None, password: str | None = None,
@@ -38,7 +38,7 @@ async def ensure_platform_owner(db, email: str | None = None, password: str | No
     if "@" not in email:
         logger.error("platform_owner invalid: PLATFORM_OWNER_EMAIL is not an email address")
         return "invalid"
-    if len(password) < OWNER_PASSWORD_MIN_LENGTH or len(password.encode("utf-8")) > 72:
+    if len(password) < OWNER_PASSWORD_MIN_LENGTH or len(password.encode("utf-8")) > PASSWORD_MAX_BYTES:
         logger.error("platform_owner invalid: PLATFORM_OWNER_PASSWORD must be %d+ characters and at most 72 UTF-8 bytes",
                      OWNER_PASSWORD_MIN_LENGTH)
         return "invalid"

@@ -72,6 +72,8 @@ async def register_new_estate(db: AsyncSession, reg_in: EstateRegistrationReques
     # (a) hashes the password in a thread while the plan lookup runs, and
     # (b) relies on the unique app_id index instead of a SELECT per candidate id,
     #     retrying only on the (1 in ~16M) collision.
+    from app.services.auth import require_acceptable_password
+    require_acceptable_password(reg_in.password)  # same rule as every other account
     hash_task = asyncio.create_task(get_password_hash_async(reg_in.password))
     try:
         tier_cfg = await get_plan(db, reg_in.tier or SubscriptionTier.STARTER)

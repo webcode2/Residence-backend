@@ -14,6 +14,22 @@ import hashlib
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# One password rule for every account type. bcrypt only reads the first 72 bytes.
+PASSWORD_MIN_LENGTH = 8
+PASSWORD_MAX_BYTES = 72
+PASSWORD_RULE_MESSAGE = f"Use at least {PASSWORD_MIN_LENGTH} characters and no more than {PASSWORD_MAX_BYTES} UTF-8 bytes"
+
+
+def password_is_acceptable(password: str) -> bool:
+    return len(password) >= PASSWORD_MIN_LENGTH and len(password.encode("utf-8")) <= PASSWORD_MAX_BYTES
+
+
+def require_acceptable_password(password: str) -> None:
+    """Raise 422 with the shared message when a chosen password breaks the rule."""
+    if not password_is_acceptable(password):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail=PASSWORD_RULE_MESSAGE)
+
 # --- Regular Tenant User Auth ---
 
 def verify_password(plain_password, hashed_password):

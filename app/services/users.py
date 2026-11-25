@@ -78,9 +78,8 @@ async def register_resident(db: AsyncSession, user_in: UserCreateSchema, registr
     # A public invitation must never change or relink an existing account.
     if row.email_taken:
         return None
-    if len(user_in.password) < 12 or len(user_in.password.encode('utf-8')) > 72:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=422, detail="Use at least 12 characters and no more than 72 UTF-8 bytes")
+    from app.services.auth import require_acceptable_password
+    require_acceptable_password(user_in.password)
     db_obj = User(email=email, full_name=user_in.full_name,
         phone=user_in.phone, hashed_password=await get_password_hash_async(user_in.password),
         roles=[UserRole.RESIDENT], house_number=token.house_number,
