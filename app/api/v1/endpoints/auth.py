@@ -30,7 +30,7 @@ async def login_for_access_token(
     Requires X-App-Id header for tenant identification.
     """
     client_ip = request.client.host if request.client else "unknown"
-    rate_key = f"{app_id}:{login_in.email}:{client_ip}"
+    rate_key = f"{app_id}:{login_in.email.strip().lower()}:{client_ip}"  # one lockout for every capitalisation
 
     # 1. Check if temporarily blocked
     is_blocked, remaining = await check_login_blocked(rate_key)

@@ -78,3 +78,25 @@ async def test_only_caretakers_register_officers_and_emails_are_unique(client, d
     assert duplicate.status_code == 409
     taken = await client.post('/api/v1/security-staff', json={**officer_body(), 'email': resident.email}, headers=caretaker)
     assert taken.status_code == 409
+
+
+async def test_estate_sign_in_ignores_email_capitalisation(client, db_session, onboarding_estate, monkeypatch):
+    app_id, caretaker = onboarding_estate
+    monkeypatch.setattr(WELCOME, AsyncMock(return_value=True))
+    officer = (await client.post('/api/v1/security-staff', json=officer_body(), headers=caretaker)).json()
+    typed = officer['email'][0].upper() + officer['email'][1:]  # what a phone keyboard sends
+    response = await client.post('/api/v1/auth/login', headers={'X-App-Id': app_id},
+                                 json={'email': '  ' + typed + ' ', 'password': officer['temporary_password']})
+    assert response.status_code == 200, response.text
+
+
+async def test_sign_in_never_guesses_between_accounts_differing_only_by_case(client, db_session, onboarding_estate):
+    app_id, _ = onboarding_estate
+    local = 'q' + uuid.uuid4().hex[:8]  # starts with a letter so capitalising changes it
+    for email, password in ((f'{local}@example.com', 'lower-password-1'), (f'{local.upper()}@example.com', 'upper-password-1')):
+        db_session.add(User(email=email, app_id=app_id, roles=[UserRole.RESIDENT], hashed_password=get_password_hash(password)))
+    await db_session.commit()
+    login = lambda email, pw: client.post('/api/v1/auth/login', headers={'X-App-Id': app_id}, json={'email': email, 'password': pw})
+    assert (await login(f'{local}@example.com', 'lower-password-1')).status_code == 200         # exact match wins
+    assert (await login(f'{local.upper()}@example.com', 'upper-password-1')).status_code == 200
+    assert (await login(f'{local.capitalize()}@example.com', 'lower-password-1')).status_code == 401  # ambiguous

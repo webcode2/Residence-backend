@@ -5,7 +5,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from app.core.config import settings
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 from app.models.user import User
 import uuid
 
@@ -83,10 +83,15 @@ def create_saas_admin_access_token(data: dict, expires_delta: Optional[timedelta
     return encoded_jwt
 
 async def authenticate_user(db: AsyncSession, email: str, password: str, app_id: str) -> Optional[User]:
-    result = await db.execute(
-        select(User).where(User.email == email, User.app_id == app_id)
-    )
-    user = result.scalar_one_or_none()
+    # Phone keyboards often capitalise the first letter, so match the email without
+    # regard to case. Prefer an exact match; if an estate holds two accounts that differ
+    # only by case (older registrations kept the typed case), never guess between them.
+    typed = email.strip()
+    candidates = (await db.execute(
+        select(User).where(func.lower(User.email) == typed.lower(), User.app_id == app_id)
+    )).scalars().all()
+    exact = [u for u in candidates if u.email == typed]
+    user = exact[0] if exact else (candidates[0] if len(candidates) == 1 else None)
     if not user:
         return None
     if not await verify_password_async(password, user.hashed_password):
