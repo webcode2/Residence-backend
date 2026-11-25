@@ -94,5 +94,9 @@ else
     echo "[ENTRYPOINT] Skipping database migrations as SKIP_MIGRATIONS=1."
 fi
 
+# Create the platform owner from PLATFORM_OWNER_* if that account does not exist yet.
+# Never modifies an existing account. A failure is logged but does not block startup.
+python3 -m app.services.owner_bootstrap || echo "[ENTRYPOINT] Platform owner bootstrap failed; continuing startup."
+
 # Execute CMD with exec to ensure proper PID 1 signal forwarding
 exec "$@"

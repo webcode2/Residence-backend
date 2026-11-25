@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import secrets
 import uuid
@@ -15,7 +16,8 @@ from app.models.onboarding import LandlordOnboardingJob as Job, LandlordImportFi
 from app.models.user import User, UserRole
 from app.schemas.landlord import LandlordImportResponseSchema
 from app.core.config import settings
-from app.services.auth import get_password_hash
+from app.core.redis import get_redis_client
+from app.services.auth import get_password_hash_async
 from app.services.notifications import notification_service
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,26 @@ RESUMABLE = ['failed', 'retrying']
 def cipher():
     # Domain-separated key derived from the deployment secret; never log/decrypt in APIs.
     return Fernet(base64.urlsafe_b64encode(hashlib.sha256(('landlord-onboarding:'+settings.SECRET_KEY).encode()).digest()))
+
+
+async def _cache_job_status(job):
+    try:
+        client = get_redis_client()
+        if not client:
+            return
+        payload = json.dumps({
+            "job_id": str(job.id),
+            "user_id": str(job.user_id) if job.user_id else None,
+            "app_id": job.app_id,
+            "email": job.email,
+            "status": job.status,
+            "attempts": job.attempts,
+            "last_error": job.last_error,
+            "updated_at": utc_now().isoformat(),
+        })
+        await client.setex(f"landlord:onboarding:{job.id}", 7 * 24 * 3600, payload)
+    except Exception:
+        logger.debug("Failed to cache landlord onboarding status: job_id=%s", job.id, exc_info=True)
 
 async def import_landlords(db, import_data, app_id, batch_id=None):
     batch_id = batch_id or uuid.uuid4()
@@ -122,7 +144,7 @@ async def process_one(db):
             user = User(email=job.email, full_name=job.full_name, phone=job.phone,
                 house_number=job.house_number, street_name=job.street_name, app_id=job.app_id,
                 roles=[UserRole.LANDLORD], must_change_password=True,
-                hashed_password=await asyncio.to_thread(get_password_hash,password))
+                hashed_password=await get_password_hash_async(password))
             db.add(user)
             await db.flush()
             job.user_id = user.id

@@ -117,7 +117,7 @@ async def test_visitor_token_creation_rate_limiting(client, db_session):
             headers=headers
         )
         assert resp.status_code == 429
-        assert "max 30 visitor tokens per minute for residents and landlords" in resp.json()["detail"]
+        assert "max 30 visitor tokens per minute for residents and hosts / property owners" in resp.json()["detail"]
         assert resp.headers["Retry-After"] == "45"
 
     # 2. Pure Security Guard CANNOT generate visitor tokens

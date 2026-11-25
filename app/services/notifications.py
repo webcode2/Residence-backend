@@ -35,7 +35,7 @@ class ResendClient:
             "subject": "Your Resident Pass Account",
             "html": f"""
                 <h2>Welcome to Resident Pass</h2>
-                <p>Hello {full_name}, your landlord account has been created.</p>
+                <p>Hello {full_name}, your Host / Property Owner account has been created.</p>
                 <p><b>Estate App ID:</b> {app_id}</p>
                 <p><b>Login Email:</b> {email}</p>
                 <p><b>Initial Password:</b> {password}</p>

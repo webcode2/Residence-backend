@@ -87,6 +87,8 @@ async def persist_token_check_in(
     }
 
     if await enqueue_token_state_update(payload):
+        from app.services.worker_wake import wake_worker
+        await wake_worker('token_state')
         return True
 
     # Redis unavailable: synchronous Postgres fallback
@@ -132,6 +134,8 @@ async def persist_token_check_out(
     }
 
     if await enqueue_token_state_update(payload):
+        from app.services.worker_wake import wake_worker
+        await wake_worker('token_state')
         return True
 
     await db.execute(

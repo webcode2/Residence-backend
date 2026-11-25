@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, UTC
 from typing import Optional
 from jose import JWTError, jwt
@@ -20,6 +21,15 @@ def verify_password(plain_password, hashed_password):
 
 def get_password_hash(password):
     return pwd_context.hash(password)
+
+# bcrypt costs ~200-400 ms of CPU. Called inline it freezes the event loop, stalling
+# every other request on the worker. Request handlers must use these async variants,
+# which run bcrypt in a thread (bcrypt releases the GIL while hashing).
+async def verify_password_async(plain_password, hashed_password) -> bool:
+    return await asyncio.to_thread(verify_password, plain_password, hashed_password)
+
+async def get_password_hash_async(password) -> str:
+    return await asyncio.to_thread(get_password_hash, password)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -52,6 +62,12 @@ def verify_saas_admin_password(plain_password: str, hashed_password: str) -> boo
     peppered = _pepper_admin_password(plain_password)
     return pwd_context.verify(peppered, hashed_password)
 
+async def verify_saas_admin_password_async(plain_password: str, hashed_password: str) -> bool:
+    return await asyncio.to_thread(verify_saas_admin_password, plain_password, hashed_password)
+
+async def get_saas_admin_password_hash_async(password: str) -> str:
+    return await asyncio.to_thread(get_saas_admin_password_hash, password)
+
 def create_saas_admin_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """
     Creates a JWT access token for SaaS Admin signed with the dedicated SAAS_ADMIN_SECRET_KEY.
@@ -73,7 +89,7 @@ async def authenticate_user(db: AsyncSession, email: str, password: str, app_id:
     user = result.scalar_one_or_none()
     if not user:
         return None
-    if not verify_password(password, user.hashed_password):
+    if not await verify_password_async(password, user.hashed_password):
         return None
     return user
 

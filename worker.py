@@ -15,8 +15,11 @@ from app.services.maintenance import run_all_maintenance_jobs
 from app.services.access_logs import drain_access_log_queue
 from app.services.token_state import drain_token_state_queue
 from app.services.chat import drain_chat_message_queue
+from app.services.landlords import _run as landlord_onboarding_loop
+from app.services.sos import _loop as sos_outbox_loop
+from app.services.history_jobs import _run as history_jobs_loop
 # Register all ORM models so FK resolution works during batch inserts
-from app.models import estate, user, token, access_log, chat  # noqa: F401
+from app.models import estate, user, token, access_log, chat, onboarding, history, sos  # noqa: F401
 
 logger = logging.getLogger("worker")
 
@@ -89,20 +92,28 @@ async def _maintenance_loop(stop_event: asyncio.Event):
 
 
 async def run_daemon():
-    """Runs continuous queue draining + periodic maintenance."""
+    """Runs continuous queue draining, maintenance, and durable job workers."""
     setup_logging()
     stop_event = asyncio.Event()
-    logger.info("Starting standalone worker daemon (queue drain + maintenance)...")
+    logger.info(
+        "Starting standalone worker daemon (queue drain + maintenance + landlord onboarding + sos outbox + history jobs)..."
+    )
+    tasks = [
+        asyncio.create_task(_queue_drain_loop(stop_event), name="worker.queue_drain"),
+        asyncio.create_task(_maintenance_loop(stop_event), name="worker.maintenance"),
+        asyncio.create_task(landlord_onboarding_loop(), name="worker.landlord_onboarding"),
+        asyncio.create_task(sos_outbox_loop(), name="worker.sos_outbox"),
+        asyncio.create_task(history_jobs_loop(), name="worker.history_jobs"),
+    ]
     try:
-        await asyncio.gather(
-            _queue_drain_loop(stop_event),
-            _maintenance_loop(stop_event),
-        )
+        await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         logger.info("Worker daemon shutting down...")
-        stop_event.set()
     finally:
         stop_event.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await close_redis()
         await engine.dispose()
 

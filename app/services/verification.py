@@ -243,7 +243,7 @@ async def verify_rfid_access(db: AsyncSession, rfid_tag: str, app_id: str) -> Op
                 event_type="rfid_verification",
                 identifier=rfid_tag,
                 status="denied",
-                denial_reason="Associated landlord revoked or inactive",
+                denial_reason="Associated host / property owner revoked or inactive",
                 user_id=cached_user.get("user_id"),
             )
             return None
@@ -306,7 +306,7 @@ async def verify_rfid_access(db: AsyncSession, rfid_tag: str, app_id: str) -> Op
                 event_type="rfid_verification",
                 identifier=rfid_tag,
                 status="denied",
-                denial_reason="Associated landlord revoked or inactive",
+                denial_reason="Associated host / property owner revoked or inactive",
                 user_id=user.id,
             )
             return None

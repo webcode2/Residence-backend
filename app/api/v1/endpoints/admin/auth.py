@@ -6,8 +6,8 @@ from app.models.user import User, UserRole
 from app.schemas.user import LoginRequestSchema, AuthResponseSchema
 from app.schemas.admin import AdminChangePasswordSchema, AdminProfileSchema
 from app.services.auth import (
-    verify_saas_admin_password,
-    get_saas_admin_password_hash,
+    verify_saas_admin_password_async,
+    get_saas_admin_password_hash_async,
     create_saas_admin_access_token,
 )
 from app.dependencies import oauth2_scheme, get_current_saas_admin
@@ -37,7 +37,8 @@ async def admin_login(
     - Does NOT require X-App-Id header.
     """
     client_ip = request.client.host if request.client else "unknown"
-    rate_key = f"admin:{login_in.email}:{client_ip}"
+    email = str(login_in.email).strip().lower()  # owner emails are stored lowercase
+    rate_key = f"admin:{email}:{client_ip}"
 
     # 1. Check if blocked
     is_blocked, remaining = await check_login_blocked(rate_key)
@@ -47,10 +48,10 @@ async def admin_login(
             detail=f"Too many failed admin login attempts. Please try again in {remaining} seconds."
         )
 
-    result = await db.execute(select(User).where(User.email == login_in.email, User.roles.contains([UserRole.SAAS_OWNER])))
+    result = await db.execute(select(User).where(User.email == email, User.roles.contains([UserRole.SAAS_OWNER])))
     user = result.scalar_one_or_none()
 
-    if not user or not verify_saas_admin_password(login_in.password, user.hashed_password):
+    if not user or not await verify_saas_admin_password_async(login_in.password, user.hashed_password):
         _, now_blocked, block_secs = await record_login_failure(rate_key)
         if now_blocked:
             raise HTTPException(
@@ -137,13 +138,13 @@ async def admin_change_password(
     admin: User = Depends(get_current_saas_admin)
 ):
     """Change SaaS Admin password using dedicated peppered hashing."""
-    if not verify_saas_admin_password(pwd_in.current_password, admin.hashed_password):
+    if not await verify_saas_admin_password_async(pwd_in.current_password, admin.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Incorrect current password"
         )
 
-    admin.hashed_password = get_saas_admin_password_hash(pwd_in.new_password)
+    admin.hashed_password = await get_saas_admin_password_hash_async(pwd_in.new_password)
     await db.commit()
     await db.refresh(admin)
 

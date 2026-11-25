@@ -4,11 +4,23 @@ from typing import List
 from app.core.database import get_db
 from app.schemas.landlord import LandlordImportSchema, LandlordImportResponseSchema
 from app.services import landlords as landlord_service
+from app.services.worker_wake import wake_worker
 from app.dependencies import check_roles, validate_tenant
 from app.models.user import UserRole
+import logging
 import uuid
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+
+async def _wake_email_worker():
+    """Welcome emails are sent by the worker; the request only queues and wakes it."""
+    await wake_worker("welcome_email")
+
+
+QUEUED_EMAIL = {"email_sent": None, "email_status": "queued", "email_warning": None}
 
 @router.post("/import", response_model=List[LandlordImportResponseSchema])
 async def import_landlords(
@@ -22,8 +34,10 @@ async def import_landlords(
     Only accessible by Caretakers (Estate Admins).
     """
     if not 1 <= len(import_data) <= 500:
-        raise HTTPException(422, "Submit 1 to 500 landlords per batch")
-    return await landlord_service.import_landlords(db, import_data, app_id)
+        raise HTTPException(422, "Submit 1 to 500 hosts / property owners per batch")
+    results = await landlord_service.import_landlords(db, import_data, app_id)
+    await _wake_email_worker()
+    return results
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
@@ -40,12 +54,15 @@ async def create_landlord(
     from sqlalchemy import select
     from app.models.user import User, UserRole
     from app.models.token import RegistrationToken
-    from app.services.auth import get_password_hash
+    from app.models.onboarding import LandlordOnboardingJob
+    from app.models.base import utc_now
+    from app.services.auth import get_password_hash_async
     from app.services.tokens import generate_registration_code
-    from app.services.notifications import notification_service
+    from app.services.landlords import cipher
+    from app.core.redis import get_redis_client
     from datetime import datetime, timedelta, UTC
     import secrets
-    import asyncio
+    import json
 
     clean_email = str(data.email).strip().lower()
     existing = (await db.execute(select(User.id).where(User.email == clean_email, User.app_id == app_id))).scalar_one_or_none()
@@ -65,7 +82,7 @@ async def create_landlord(
         app_id=app_id,
         roles=[UserRole.LANDLORD],
         must_change_password=True,
-        hashed_password=get_password_hash(temp_password)
+        hashed_password=await get_password_hash_async(temp_password)
     )
     db.add(user)
     await db.flush()
@@ -101,16 +118,69 @@ async def create_landlord(
     except Exception:
         pass
 
-    # Fire-and-forget welcome email if configured; do not block or fail creation
+    job_id = uuid.uuid4()
+    now = utc_now()
+    job = LandlordOnboardingJob(
+        id=job_id,
+        batch_id=uuid.uuid4(),
+        app_id=app_id,
+        email=clean_email,
+        full_name=user.full_name,
+        phone=user.phone,
+        house_number=user.house_number,
+        street_name=user.street_name,
+        status="queued",
+        attempts=0,
+        next_attempt_at=now,
+        password_ciphertext=cipher().encrypt(temp_password.encode()).decode(),
+        user_id=user.id,
+    )
+    db.add(job)
     try:
-        asyncio.create_task(
-            notification_service.send_registration_email(
-                clean_email, temp_password, full_name=user.full_name, app_id=app_id
-            )
-        )
+        await db.commit()
     except Exception:
-        pass
+        await db.rollback()
+        # If a job row already exists for this app/email, requeue it for the new account.
+        existing_job = (await db.execute(
+            select(LandlordOnboardingJob).where(
+                LandlordOnboardingJob.app_id == app_id,
+                LandlordOnboardingJob.email == clean_email,
+            )
+        )).scalar_one_or_none()
+        if existing_job is None:
+            raise
+        existing_job.batch_id = job.batch_id
+        existing_job.user_id = user.id
+        existing_job.full_name = user.full_name
+        existing_job.phone = user.phone
+        existing_job.house_number = user.house_number
+        existing_job.street_name = user.street_name
+        existing_job.status = "queued"
+        existing_job.attempts = 0
+        existing_job.next_attempt_at = now
+        existing_job.last_error = None
+        existing_job.lease_until = None
+        existing_job.password_ciphertext = cipher().encrypt(temp_password.encode()).decode()
+        await db.commit()
+        job_id = existing_job.id
 
+    # Register follow-up status in Redis for fast polling/UI updates.
+    try:
+        redis_client = get_redis_client()
+        if redis_client:
+            payload = json.dumps({
+                "job_id": str(job_id),
+                "user_id": str(user.id),
+                "app_id": app_id,
+                "email": clean_email,
+                "status": "queued",
+                "updated_at": now.isoformat(),
+            })
+            await redis_client.setex(f"landlord:onboarding:{job_id}", 7 * 24 * 3600, payload)
+    except Exception:
+        logger.warning("Failed to cache landlord onboarding status in Redis: job_id=%s", job_id, exc_info=True)
+
+    await _wake_email_worker()
     return {
         "id": str(user.id),
         "full_name": user.full_name,
@@ -122,7 +192,9 @@ async def create_landlord(
         "status": "active",
         "type": "permanent",
         "temporary_password": temp_password,
-        "message": "Landlord added successfully"
+        "job_id": str(job_id),
+        **QUEUED_EMAIL,
+        "message": "Host / Property Owner added successfully. Welcome email is on its way.",
     }
 
 
@@ -220,7 +292,9 @@ async def import_landlord_file(file: UploadFile = File(...), app_id: str = Depen
     batch_id = uuid.uuid4()
     db.add(LandlordImportFile(app_id=app_id, filename=filename, content_type=types[suffix],
         content=content, size_bytes=len(content), batch_id=batch_id, uploaded_by=current_user.id))
-    return await landlord_service.import_landlords(db, entries, app_id, batch_id=batch_id)
+    results = await landlord_service.import_landlords(db, entries, app_id, batch_id=batch_id)
+    await _wake_email_worker()
+    return results
 
 @router.get('/onboarding-jobs')
 async def onboarding_jobs(app_id: str = Depends(validate_tenant), db: AsyncSession = Depends(get_db),
@@ -252,7 +326,9 @@ async def import_batches(app_id: str = Depends(validate_tenant), db: AsyncSessio
 @router.post('/import-batches/{batch_id}/retry')
 async def retry_import_batch(batch_id: uuid.UUID, app_id: str = Depends(validate_tenant),
     db: AsyncSession = Depends(get_db), current_user = Depends(check_roles([UserRole.CARETAKER]))):
-    return await landlord_service.retry_batch(db, app_id, batch_id)
+    result = await landlord_service.retry_batch(db, app_id, batch_id)
+    await _wake_email_worker()
+    return result
 
 @router.post('/onboarding-jobs/{job_id}/retry')
 async def retry_onboarding_job(job_id: uuid.UUID, app_id: str = Depends(validate_tenant),
@@ -270,6 +346,7 @@ async def retry_onboarding_job(job_id: uuid.UUID, app_id: str = Depends(validate
     job.next_attempt_at = utc_now()
     job.last_error = None
     await db.commit()
+    await _wake_email_worker()
     return {'status':'queued'}
 
 @router.get('/household')
@@ -332,3 +409,103 @@ async def delete_import_file(file_id: uuid.UUID, app_id: str = Depends(validate_
     stored.content = None
     stored.deleted_at = utc_now()
     await db.commit()
+
+
+@router.post('/{user_id}/resend-welcome')
+async def resend_landlord_welcome(
+    user_id: uuid.UUID,
+    app_id: str = Depends(validate_tenant),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(check_roles([UserRole.CARETAKER]))
+):
+    """Generate a new temporary password and queue a welcome email for an existing landlord."""
+    from sqlalchemy import select
+    from app.models.user import User, UserRole
+    from app.models.onboarding import LandlordOnboardingJob
+    from app.models.base import utc_now
+    from app.services.auth import get_password_hash_async
+    from app.services.landlords import cipher
+    from app.core.redis import get_redis_client
+    import secrets
+    import json
+
+    user = (await db.execute(
+        select(User).where(User.id == user_id, User.app_id == app_id)
+    )).scalar_one_or_none()
+    if not user or UserRole.LANDLORD not in user.roles:
+        raise HTTPException(status_code=404, detail="Host / Property Owner not found")
+    if user.is_revoked:
+        raise HTTPException(status_code=409, detail="Cannot resend welcome email for a revoked host / property owner")
+
+    temp_password = secrets.token_urlsafe(14)
+    user.hashed_password = await get_password_hash_async(temp_password)
+    user.must_change_password = True
+
+    job_id = uuid.uuid4()
+    now = utc_now()
+    job = LandlordOnboardingJob(
+        id=job_id,
+        batch_id=uuid.uuid4(),
+        app_id=app_id,
+        email=user.email,
+        full_name=user.full_name or user.email,
+        phone=user.phone,
+        house_number=user.house_number,
+        street_name=user.street_name,
+        status="queued",
+        attempts=0,
+        next_attempt_at=now,
+        password_ciphertext=cipher().encrypt(temp_password.encode()).decode(),
+        user_id=user.id,
+    )
+    db.add(job)
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        existing_job = (await db.execute(
+            select(LandlordOnboardingJob).where(
+                LandlordOnboardingJob.app_id == app_id,
+                LandlordOnboardingJob.email == user.email,
+            )
+        )).scalar_one_or_none()
+        if existing_job is None:
+            raise
+        existing_job.batch_id = job.batch_id
+        existing_job.user_id = user.id
+        existing_job.full_name = user.full_name or user.email
+        existing_job.phone = user.phone
+        existing_job.house_number = user.house_number
+        existing_job.street_name = user.street_name
+        existing_job.status = "queued"
+        existing_job.attempts = 0
+        existing_job.next_attempt_at = now
+        existing_job.last_error = None
+        existing_job.lease_until = None
+        existing_job.password_ciphertext = cipher().encrypt(temp_password.encode()).decode()
+        await db.commit()
+        job_id = existing_job.id
+
+    try:
+        redis_client = get_redis_client()
+        if redis_client:
+            payload = json.dumps({
+                "job_id": str(job_id),
+                "user_id": str(user.id),
+                "app_id": app_id,
+                "email": user.email,
+                "status": "queued",
+                "updated_at": now.isoformat(),
+            })
+            await redis_client.setex(f"landlord:onboarding:{job_id}", 7 * 24 * 3600, payload)
+    except Exception:
+        logger.warning("Failed to cache landlord onboarding status in Redis: job_id=%s", job_id, exc_info=True)
+
+    await _wake_email_worker()
+    return {
+        "user_id": str(user.id),
+        "job_id": str(job_id),
+        **QUEUED_EMAIL,
+        "temporary_password": temp_password,
+        "message": "Welcome email is on its way. A new temporary password was generated.",
+    }

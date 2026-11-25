@@ -68,6 +68,11 @@ def job_view(job,retention_days=None):
         expires_at=job.expires_at,confirmed_at=job.confirmed_at,can_download=job.kind=='export' and job.status=='completed'
         and not expired)
 
+async def _wake_history_worker():
+    from app.services.worker_wake import wake_worker
+    await wake_worker('history')
+
+
 @router.get('/jobs')
 async def list_history_jobs(app_id: str = Depends(validate_tenant),db: AsyncSession = Depends(get_db),
     user: User = Depends(check_roles([UserRole.CARETAKER]))):
@@ -82,19 +87,25 @@ async def list_history_jobs(app_id: str = Depends(validate_tenant),db: AsyncSess
 @router.post('/exports',status_code=202)
 async def queue_export(body: HistoryJobRequest,db: AsyncSession = Depends(get_db),user: User = Depends(check_roles([UserRole.CARETAKER]))):
     from app.services.history_jobs import create_job
-    return job_view(await create_job(db,user,'export',body.start_at,body.end_at,body.status))
+    job=await create_job(db,user,'export',body.start_at,body.end_at,body.status)
+    await _wake_history_worker()
+    return job_view(job)
 
 @router.post('/purge-preview',status_code=202)
 async def queue_purge_preview(body: HistoryJobRequest,db: AsyncSession = Depends(get_db),user: User = Depends(check_roles([UserRole.CARETAKER]))):
     if body.end_at is None:
         raise HTTPException(422,'Choose the date before which records should be deleted')
     from app.services.history_jobs import create_job
-    return job_view(await create_job(db,user,'purge',body.start_at,body.end_at,body.status))
+    job=await create_job(db,user,'purge',body.start_at,body.end_at,body.status)
+    await _wake_history_worker()
+    return job_view(job)
 
 @router.post('/jobs/{job_id}/confirm')
 async def confirm_history_purge(job_id: uuid.UUID,body: PurgeConfirmation,db: AsyncSession = Depends(get_db),user: User = Depends(check_roles([UserRole.CARETAKER]))):
     from app.services.history_jobs import confirm_purge
-    return job_view(await confirm_purge(db,user,job_id,body.confirmation))
+    job=await confirm_purge(db,user,job_id,body.confirmation)
+    await _wake_history_worker()
+    return job_view(job)
 
 @router.post('/jobs/{job_id}/retry')
 async def retry_history_job(job_id: uuid.UUID,db: AsyncSession = Depends(get_db),user: User = Depends(check_roles([UserRole.CARETAKER]))):
@@ -114,7 +125,9 @@ async def retry_history_job(job_id: uuid.UUID,db: AsyncSession = Depends(get_db)
     job.attempts=0;job.last_error=None;job.next_attempt_at=utc_now()
     from app.models.admin_audit import AdminAuditLog
     db.add(AdminAuditLog(actor_id=user.id,actor_email=user.email,action='history.job.retry',target_type='estate_history',target_id=str(job.id),changes={'app_id':user.app_id,'kind':job.kind}))
-    await db.commit();return job_view(job)
+    await db.commit()
+    await _wake_history_worker()
+    return job_view(job)
 
 @router.get('/jobs/{job_id}/download')
 async def download_history_export(job_id: uuid.UUID,db: AsyncSession = Depends(get_db),user: User = Depends(check_roles([UserRole.CARETAKER]))):

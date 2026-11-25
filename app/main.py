@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.core.config import settings
-from app.core.database import engine
+from app.core.database import engine, warm_pool
 from app.core.redis import get_redis_client, close_redis
 from app.core.logging import setup_logging
 from app.models import onboarding, history
@@ -29,27 +29,33 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     setup_logging()
     logger.info(f"Starting {settings.PROJECT_NAME} in [{settings.ENVIRONMENT.upper()}] mode")
-    from app.services.sos import start_worker
-    start_worker()
-    from app.services.landlords import start_worker as start_onboarding_worker
-    start_onboarding_worker()
-    from app.services.history_jobs import start_worker as start_history_worker
-    start_history_worker()
+    if settings.ENABLE_EMBEDDED_WORKERS:
+        from app.services.sos import start_worker
+        start_worker()
+        from app.services.landlords import start_worker as start_onboarding_worker
+        start_onboarding_worker()
+        from app.services.history_jobs import start_worker as start_history_worker
+        start_history_worker()
+        logger.info("Embedded background workers started (sos, landlords, history_jobs)")
+    else:
+        logger.info("Embedded background workers disabled; expecting dedicated worker process")
     start_maintenance_scheduler()
     await chat_hub.start()
+    await warm_pool()
     yield
     logger.info(f"Initiating graceful shutdown for {settings.PROJECT_NAME}...")
-    from app.services.sos import stop_worker
-    await stop_worker()
+    if settings.ENABLE_EMBEDDED_WORKERS:
+        from app.services.sos import stop_worker
+        await stop_worker()
+        from app.services.landlords import stop_worker as stop_onboarding_worker
+        await stop_onboarding_worker()
+        from app.services.history_jobs import stop_worker as stop_history_worker
+        await stop_history_worker()
     await chat_hub.stop()
-    from app.services.landlords import stop_worker as stop_onboarding_worker
-    await stop_onboarding_worker()
-    from app.services.history_jobs import stop_worker as stop_history_worker
-    await stop_history_worker()
     await stop_maintenance_scheduler()
     await close_redis()
     await engine.dispose()
-    logger.info("Maintenance scheduler, Database, and Redis connections successfully closed.")
+    logger.info("Background workers, maintenance scheduler, database, and Redis connections successfully closed.")
 
 
 app = FastAPI(
@@ -74,12 +80,36 @@ async def request_lifecycle_middleware(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     request.state.request_id = request_id
     start_time = time.perf_counter()
-
-    response = await call_next(request)
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+    except Exception:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        if request.url.path not in ("/", "/healthz", "/ready"):
+            logger.exception(
+                "http_request_failed method=%s path=%s status=%s duration_ms=%.2f request_id=%s",
+                request.method,
+                request.url.path,
+                status_code,
+                duration_ms,
+                request_id,
+            )
+        raise
 
     duration_ms = (time.perf_counter() - start_time) * 1000
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Process-Time-Ms"] = f"{duration_ms:.2f}"
+    log_fn = logger.warning if duration_ms >= 1000 else logger.info
+    if request.url.path not in ("/", "/healthz", "/ready"):
+        log_fn(
+            "http_request method=%s path=%s status=%s duration_ms=%.2f request_id=%s",
+            request.method,
+            request.url.path,
+            status_code,
+            duration_ms,
+            request_id,
+        )
 
     # Essential Production Security Headers
     response.headers["X-Content-Type-Options"] = "nosniff"

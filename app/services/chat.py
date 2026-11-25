@@ -350,7 +350,12 @@ async def drain_chat_message_queue(
             )).scalars().all()
             valid_tids = set(existing_threads)
 
-            valid_messages = [m for m in messages if m.thread_id in valid_tids]
+            # A sender deleted after queueing would fail the foreign key and block the queue.
+            sender_ids = {m.sender_id for m in messages}
+            valid_senders = set((await db.execute(
+                select(User.id).where(User.id.in_(sender_ids))
+            )).scalars().all()) if sender_ids else set()
+            valid_messages = [m for m in messages if m.thread_id in valid_tids and m.sender_id in valid_senders]
             if valid_messages:
                 db.add_all(valid_messages)
 
@@ -554,7 +559,10 @@ async def send_message(
     }
 
     queued = await enqueue_chat_message(payload)
-    if not queued:
+    if queued:
+        from app.services.worker_wake import wake_worker
+        await wake_worker('chat_message')
+    else:
         db.add(message)
         await db.commit()
 
@@ -624,7 +632,10 @@ async def resolve_thread(db: AsyncSession, user: User, thread_id: uuid.UUID) -> 
     }
 
     queued = await enqueue_chat_message(payload)
-    if not queued:
+    if queued:
+        from app.services.worker_wake import wake_worker
+        await wake_worker('chat_message')
+    else:
         db.add(message)
         await db.commit()
 

@@ -63,7 +63,7 @@ async def create_user(
     if UserRole.SAAS_OWNER in user_in.roles:
         raise HTTPException(status_code=403, detail="Platform owner roles cannot be assigned by estate accounts")
     if UserRole.LANDLORD in user_in.roles:
-        raise HTTPException(status_code=409, detail="Landlords must be onboarded through the caretaker import queue")
+        raise HTTPException(status_code=409, detail="Hosts / Property Owners must be onboarded through the caretaker import queue")
     # Ensure app_id in payload matches the header app_id for safety
     user_in.app_id = app_id
     
@@ -170,7 +170,7 @@ async def update_user(
     if user_in.roles is not None and UserRole.LANDLORD in user_in.roles:
         target = await user_service.get_user(db, user_id, app_id)
         if target and UserRole.LANDLORD not in target.roles:
-            raise HTTPException(status_code=409, detail="Landlords must be onboarded through the caretaker import queue")
+            raise HTTPException(status_code=409, detail="Hosts / Property Owners must be onboarded through the caretaker import queue")
     user = await user_service.update_user(db, user_id, user_in, app_id)
     if not user:
         raise HTTPException(
@@ -179,20 +179,60 @@ async def update_user(
         )
     return user
 
-@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["users"])
+@router.delete("/{user_id}", tags=["users"])
 async def delete_user(
     user_id: uuid.UUID,
     app_id: str = Depends(validate_tenant),
     db: AsyncSession = Depends(get_db),
     current_user = Depends(check_roles([UserRole.CARETAKER]))
 ):
-    success = await user_service.delete_user(db, user_id, app_id)
-    if not success:
+    result = await user_service.delete_user(db, user_id, app_id)
+    if not result:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
         )
-    return None
+    if result == "revoked":
+        return {
+            "status": "revoked",
+            "message": "Account has related records and was suspended to preserve history. Data was not permanently deleted.",
+        }
+    return {"status": "deleted", "message": "Account permanently deleted."}
+
+
+@router.patch("/{user_id}/status", response_model=UserSchema, tags=["users"])
+async def set_user_status(
+    user_id: uuid.UUID,
+    body: dict,
+    app_id: str = Depends(validate_tenant),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(check_roles([UserRole.CARETAKER]))
+):
+    """Suspend or restore a user account within the estate."""
+    if "is_revoked" not in body or not isinstance(body["is_revoked"], bool):
+        raise HTTPException(status_code=422, detail="is_revoked boolean is required")
+    target = await user_service.get_user(db, user_id, app_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if UserRole.SAAS_OWNER in target.roles:
+        raise HTTPException(status_code=403, detail="Platform owner accounts cannot be managed here")
+    if target.id == current_user.id:
+        raise HTTPException(status_code=409, detail="You cannot change your own account status")
+    target.is_revoked = body["is_revoked"]
+    if body["is_revoked"]:
+        target.fcm_token = None
+    await db.commit()
+    await db.refresh(target)
+    from app.core.redis import invalidate_cached_user, invalidate_cached_rfid_user
+    await invalidate_cached_user(app_id, target.email)
+    await invalidate_cached_rfid_user(app_id, target.rfid_tag)
+    if UserRole.LANDLORD in target.roles:
+        from sqlalchemy import select
+        residents = (await db.execute(select(User).where(User.landlord_id == target.id, User.app_id == app_id))).scalars().all()
+        for resident in residents:
+            await invalidate_cached_rfid_user(app_id, resident.rfid_tag)
+            await invalidate_cached_user(app_id, resident.email)
+    return target
 @router.delete("/me/fcm-token", tags=["users"])
 async def unregister_my_device(fcm_in: FCMTokenUpdateSchema, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     from sqlalchemy import delete, select

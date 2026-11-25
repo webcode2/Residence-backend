@@ -31,6 +31,18 @@ class Settings(BaseSettings):
     # Isolated cryptographic secrets for SaaS Admin (Platform Owner)
     SAAS_ADMIN_SECRET_KEY: str = "saas_admin_isolated_super_secret_jwt_key_prod"
     SAAS_ADMIN_PASSWORD_PEPPER: str = "saas_admin_isolated_password_pepper_secret_salt_prod"
+    # Platform owner (SaaS admin) created on startup when no account with this
+    # email exists yet. Existing accounts are never modified or re-passworded.
+    # Scale-to-zero worker service woken through Google Cloud Tasks after work is
+    # queued (see app/services/worker_wake.py). Leave empty locally: docker compose
+    # runs embedded / dedicated workers that poll instead.
+    WORKER_WAKE_URL: str = ""          # https://<worker>.run.app/internal/drain
+    WORKER_TASKS_QUEUE: str = ""       # projects/<p>/locations/<region>/queues/<queue>
+    WORKER_TASKS_INVOKER_SA: str = ""  # service account Cloud Tasks signs OIDC tokens as
+    WORKER_DRAIN_BUDGET_SECONDS: int = 600
+    PLATFORM_OWNER_EMAIL: str = ""
+    PLATFORM_OWNER_PASSWORD: str = ""
+    PLATFORM_OWNER_NAME: str = "Residence Platform Owner"
 
 
     POSTGRES_SERVER: str = "localhost"
@@ -46,6 +58,13 @@ class Settings(BaseSettings):
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 5
     DB_POOL_RECYCLE: int = 300
+    # Liveness-check a pooled connection only when it sat idle this long (seconds).
+    # A full pre-ping costs ~3 DB round trips (BEGIN/;/ROLLBACK) on every request,
+    # which is ~700 ms when the database is on another continent. 0 = always ping.
+    DB_POOL_PING_IDLE_SECONDS: float = 30.0
+    # Connections each worker opens at startup so the first requests skip the
+    # TCP+TLS+auth handshake and dialect initialisation (~6 s against remote Neon).
+    DB_POOL_WARM_CONNECTIONS: int = 2
     REDIS_URL: str = "redis://localhost:6379/0"
 
     # Resend Settings
@@ -69,6 +88,9 @@ class Settings(BaseSettings):
 
     # Automated Maintenance & Cron Settings
     ENABLE_MAINTENANCE_SCHEDULER: bool = True
+    # Run in-process background job workers inside the API lifespan.
+    # Disable when running a dedicated worker process (python worker.py --daemon).
+    ENABLE_EMBEDDED_WORKERS: bool = True
     MAINTENANCE_INTERVAL_SECONDS: int = 3600  # Run maintenance routines every hour
     ACCESS_LOG_DRAIN_INTERVAL_SECONDS: float = 2.0
     ACCESS_LOG_DRAIN_BATCH_SIZE: int = 500
@@ -77,7 +99,7 @@ class Settings(BaseSettings):
     CHAT_MESSAGE_DRAIN_INTERVAL_SECONDS: float = 2.0
     CHAT_MESSAGE_DRAIN_BATCH_SIZE: int = 500
 
-    @field_validator("ENABLE_MAINTENANCE_SCHEDULER", mode="before")
+    @field_validator("ENABLE_MAINTENANCE_SCHEDULER", "ENABLE_EMBEDDED_WORKERS", mode="before")
     @classmethod
     def assemble_bool_scheduler(cls, v: Any) -> bool:
         if isinstance(v, str):

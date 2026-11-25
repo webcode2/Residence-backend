@@ -57,12 +57,13 @@ The platform includes background routines for time-dependent lifecycle managemen
 3. **Token Cleanup**: Transitions unredeemed visitor tokens past 24 hours to `expired` and clears stale exit codes.
 
 ### Execution Options:
-* **Built-in Async Scheduler**: Runs automatically inside the FastAPI process on a configured interval (default: 1 hour). Configured via `ENABLE_MAINTENANCE_SCHEDULER` and `MAINTENANCE_INTERVAL_SECONDS`.
-* **Standalone CLI Worker (CronJob / Orchestrator)**:
+* **Embedded API workers**: For simple/dev single-process runs, the API lifespan can start background job workers and the maintenance scheduler in-process. Controlled by `ENABLE_EMBEDDED_WORKERS` and `ENABLE_MAINTENANCE_SCHEDULER`.
+* **Dedicated worker process (recommended for production)**:
   ```bash
   python worker.py          # Runs a single maintenance pass and exits (ideal for K8s CronJobs / Linux crontab)
-  python worker.py --daemon # Runs continuously as an independent background daemon
+  python worker.py --daemon # Runs continuously: Redis queue drains + maintenance + landlord onboarding + SOS outbox + history jobs
   ```
+  In production compose, set `ENABLE_EMBEDDED_WORKERS=false` and `ENABLE_MAINTENANCE_SCHEDULER=false` on API instances and run the `worker` service.
 * **On-Demand Admin Endpoint**:
   ```http
   POST /api/v1/admin/maintenance/run

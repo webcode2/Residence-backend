@@ -11,7 +11,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./residence-336b6-firebase-adminsdk-fbsvc-6ef51abbb7.json:/app/residence-336b6-firebase-adminsdk-fbsvc-6ef51abbb7.json:ro
+      - ./residence-elastrocloud-firebase-adminsdk-fbsvc.json:/app/residence-elastrocloud-firebase-adminsdk-fbsvc.json:ro
     environment:
       - ENVIRONMENT=production
       - DB_USE_PGBOUNCER=false
@@ -20,6 +20,7 @@ services:
       - DB_URL=${DB_URL:?DB_URL must be set in .env (Neon postgresql:// URL)}
       - REDIS_URL=${REDIS_URL:?REDIS_URL must be set in .env (Upstash rediss:// URL)}
       - ENABLE_MAINTENANCE_SCHEDULER=false
+      - ENABLE_EMBEDDED_WORKERS=false
     ports:
       - "8000:8000"
     networks:
@@ -35,7 +36,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./residence-336b6-firebase-adminsdk-fbsvc-6ef51abbb7.json:/app/residence-336b6-firebase-adminsdk-fbsvc-6ef51abbb7.json:ro
+      - ./residence-elastrocloud-firebase-adminsdk-fbsvc.json:/app/residence-elastrocloud-firebase-adminsdk-fbsvc.json:ro
     environment:
       - ENVIRONMENT=production
       - DB_USE_PGBOUNCER=false

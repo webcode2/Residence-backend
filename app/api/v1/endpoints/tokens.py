@@ -108,7 +108,7 @@ async def create_visitor_token(
         role_label = "caretakers"
     else:
         max_tokens = 30
-        role_label = "residents and landlords"
+        role_label = "residents and hosts / property owners"
 
     is_allowed, count, retry_after = await check_rate_limit(
         key_prefix="token_create:visitor",
@@ -211,7 +211,7 @@ async def generate_bookout_token(
         role_label = "caretakers"
     else:
         max_tokens = 30
-        role_label = "residents and landlords"
+        role_label = "residents and hosts / property owners"
 
     is_allowed, count, retry_after = await check_rate_limit(
         key_prefix="token_create:bookout",

@@ -12,7 +12,7 @@ States: queued → processing → sent; transient failures → retrying → proc
 
 ## Durable processing
 
-`landlord_onboarding_jobs` in PostgreSQL is the persistent queue. Every API worker starts a queue consumer. Consumers claim rows with SKIP LOCKED, use a two-minute processing lease, and reclaim expired leases after crashes. Per-job processing locks prevent concurrent email attempts. Failed attempts back off exponentially; no API request waits for email delivery.
+`landlord_onboarding_jobs` in PostgreSQL is the persistent queue. Queue consumers run in the dedicated `python worker.py --daemon` process, or in API processes when `ENABLE_EMBEDDED_WORKERS=true` (simple/dev single-process mode). Consumers claim rows with SKIP LOCKED, use a two-minute processing lease, and reclaim expired leases after crashes. Per-job processing locks prevent concurrent email attempts. Failed attempts back off exponentially; no API request waits for email delivery.
 
 The worker creates one landlord account with a random temporary password. Pending email credentials are encrypted using a domain-separated key derived from SECRET_KEY. Password ciphertext is never returned by APIs and is cleared after provider acceptance. Retries reuse the password and stable Resend idempotency key. Resend's deduplication window is provider-controlled; an exceptionally delayed retry can deliver the same email again, but it will not create another account or rotate the password. Drain pending jobs before rotating SECRET_KEY, or re-encrypt pending credentials under the new key.
 

@@ -3,7 +3,8 @@ FROM python:3.12-slim
 # Prevent Python from writing .pyc files and enable unbuffered logging
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    ENVIRONMENT=production
+    ENVIRONMENT=production \
+    PORT=8000
 
 WORKDIR /app
 
@@ -29,15 +30,17 @@ RUN chmod +x entrypoint.sh && \
 # Switch to unprivileged user
 USER appuser
 
-# Expose standard web application port
-EXPOSE 8000
+# Cloud Run injects PORT (8080); local Docker keeps 8000.
+EXPOSE $PORT
 
 # Container health probe
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:8000/healthz || exit 1
+    CMD curl -f http://localhost:${PORT}/healthz || exit 1
 
 # Entrypoint script waits for dependencies and runs Alembic migrations
 ENTRYPOINT ["/app/entrypoint.sh"]
 
 # Multi-process production ASGI server via Gunicorn + Uvicorn Workers
-CMD ["gunicorn", "app.main:app", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "--access-logfile", "-", "--error-logfile", "-"]
+# --timeout 0: Cloud Run throttles CPU between requests, which makes gunicorn's
+# heartbeat look stale and SIGABRT healthy workers. Cloud Run enforces request timeouts.
+CMD ["sh", "-c", "gunicorn app.main:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT} --timeout 0 --access-logfile - --error-logfile -"]

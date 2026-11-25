@@ -170,7 +170,7 @@ async def create_registration_token(
     host = (await db.execute(select(User).where(User.id == landlord_id, User.app_id == app_id,
         User.is_revoked.is_(False)))).scalar_one_or_none()
     if not host or UserRole.LANDLORD not in host.roles or host.must_change_password:
-        raise HTTPException(403, "An active onboarded landlord is required")
+        raise HTTPException(403, "An active onboarded host / property owner is required")
     db_obj = RegistrationToken(
         code=generate_registration_code(),
         landlord_id=landlord_id,

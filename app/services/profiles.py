@@ -9,7 +9,7 @@ from app.core.redis import invalidate_cached_user, invalidate_cached_rfid_user, 
 from app.models.user import User, UserRole
 from app.models.token import RegistrationToken
 from app.models.estate import Estate
-from app.services.auth import verify_password, create_access_token
+from app.services.auth import verify_password_async, create_access_token
 
 
 async def update_profile(db, current_user, profile, token):
@@ -24,7 +24,7 @@ async def update_profile(db, current_user, profile, token):
         raise HTTPException(422, 'Enter your full name')
     old_email = user.email
     if new_email != old_email:
-        if not profile.current_password or len(profile.current_password.encode("utf-8"))>72 or not verify_password(profile.current_password, user.hashed_password):
+        if not profile.current_password or len(profile.current_password.encode("utf-8"))>72 or not await verify_password_async(profile.current_password, user.hashed_password):
             raise HTTPException(400, 'Enter your current password to change your email')
         exists = await db.scalar(select(User.id).where(User.email == new_email, User.app_id == user.app_id, User.id != user.id))
         if exists:

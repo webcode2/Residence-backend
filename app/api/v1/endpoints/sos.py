@@ -12,13 +12,16 @@ from app.models.admin_audit import AdminAuditLog
 from app.services.history_policy import retention
 from datetime import timedelta
 from app.services import sos
+from app.services.worker_wake import wake_worker
 router=APIRouter()
 class SOSRequest(BaseModel):
     request_id: uuid.UUID
 
 @router.post('')
 async def create_sos(body:SOSRequest,db:AsyncSession=Depends(get_db),user:User=Depends(get_current_user)):
-    return await sos.create(db,user,body.request_id)
+    result = await sos.create(db,user,body.request_id)
+    await wake_worker('sos')  # pushes are sent by the worker; respond immediately
+    return result
 
 
 def caretaker(user):
@@ -82,6 +85,7 @@ async def resolve_sos(alert_id:uuid.UUID,db:AsyncSession=Depends(get_db),user:Us
     if alert.sender_id!=user.id and not set(user.roles).intersection([UserRole.CARETAKER,UserRole.SECURITY]):
         raise HTTPException(403,'Only the sender, caretaker or security can resolve this alert.')
     alert.status='resolved';await db.commit()
+    await wake_worker('sos')
     return await sos.summary(db,alert)
 
 

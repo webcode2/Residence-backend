@@ -10,6 +10,7 @@ settings.DATABASE_URL = url.set(host="127.0.0.1", port=5432).render_as_string(hi
 settings.DIRECT_DATABASE_URL = settings.DATABASE_URL
 settings.REDIS_URL = "redis://127.0.0.1:6379/14"
 settings.ENABLE_MAINTENANCE_SCHEDULER = False
+settings.ENABLE_EMBEDDED_WORKERS = False
 
 if __name__ == "__main__":
     import uvicorn

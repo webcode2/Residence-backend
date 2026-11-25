@@ -57,6 +57,8 @@ async def record_access_event(
     }
 
     if await enqueue_access_log(payload):
+        from app.services.worker_wake import wake_worker
+        await wake_worker('access_log')
         return
 
     if db is None:
@@ -115,6 +117,7 @@ async def drain_access_log_queue(
                 log.created_at = created_at
             rows.append(log)
 
+        await _clear_missing_people(db, rows)
         rows=await _persistable_logs(db,rows)
         db.add_all(rows)
         await db.commit()
@@ -124,6 +127,25 @@ async def drain_access_log_queue(
         await db.rollback()
         await requeue_access_logs(raw_items)
         raise
+
+
+async def _clear_missing_people(db, rows):
+    """Keep gate records whose resident/user was deleted after the event was queued.
+
+    Without this, one such row fails the foreign key, the batch is re-queued, and the
+    access-log queue is blocked for good. The event is kept; only the dangling link is
+    cleared.
+    """
+    from app.models.user import User
+    ids = {ref for row in rows for ref in (row.user_id, row.resident_id) if ref}
+    if not ids:
+        return
+    existing = set((await db.execute(select(User.id).where(User.id.in_(ids)))).scalars().all())
+    for row in rows:
+        if row.user_id and row.user_id not in existing:
+            row.user_id = None
+        if row.resident_id and row.resident_id not in existing:
+            row.resident_id = None
 
 
 async def _persistable_logs(db,rows):

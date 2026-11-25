@@ -56,7 +56,7 @@ def parse_file(filename, content):
                 fields = ', '.join(str(e['loc'][0]) for e in exc.errors())
                 raise ValueError(f'Row {number}: check {fields}') from None
         if not results:
-            raise ValueError('The file has no landlord rows')
+            raise ValueError('The file has no host / property owner rows')
         return results
     except HTTPException:
         raise

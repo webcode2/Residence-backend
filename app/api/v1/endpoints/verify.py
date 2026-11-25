@@ -27,7 +27,7 @@ async def verify_rfid(
     if not result:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Access Denied: Invalid tag or revoked user/landlord"
+            detail="Access Denied: Invalid tag or revoked user/host / property owner"
         )
     await _notify_visitor_access(db, app_id, result)
     return result
