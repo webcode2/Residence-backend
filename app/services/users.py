@@ -28,6 +28,8 @@ async def create_user(db: AsyncSession, user_in: UserCreateSchema) -> User:
     db.add(db_obj)
     await db.commit()
     await db.refresh(db_obj)
+    from app.core.redis import invalidate_cached_user
+    await invalidate_cached_user(db_obj.app_id, db_obj.email)
     return db_obj
 
 async def get_user_by_email(db: AsyncSession, email: str, app_id: Optional[str] = None) -> Optional[User]:
@@ -88,6 +90,8 @@ async def register_resident(db: AsyncSession, user_in: UserCreateSchema, registr
     token.is_used = True
     await db.commit()
     await invalidate_cached_registration_token(app_id, token.code)
+    from app.core.redis import invalidate_cached_user
+    await invalidate_cached_user(app_id, email)
     # Every serialized field is set above or by a Python-side default, so a refresh
     # (BEGIN + SELECT + ROLLBACK) is only needed when the session expires on commit.
     if db.sync_session.expire_on_commit:

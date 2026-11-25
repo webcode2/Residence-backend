@@ -27,8 +27,10 @@ async def update_my_fcm_token(
     return {"status": "success", "message": "FCM token synced successfully"}
 
 @router.get("/me/profile", response_model=UserSchema, tags=["profiling"])
-async def get_my_profile(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    return await db.get(User, current_user.id, populate_existing=True)
+async def get_my_profile(current_user: User = Depends(get_current_user)):
+    # Served from the Redis-cached profile loaded during authentication (Postgres only on
+    # a cache miss). Every profile change invalidates that cache entry.
+    return current_user
 
 @router.patch("/me/profile", response_model=AuthResponseSchema, tags=["profiling"])
 async def update_my_profile(

@@ -61,6 +61,41 @@ class ResendClient:
                 logger.error(f"Failed to send Resend registration email: {e}")
                 return False
 
+    async def send_staff_welcome_email(self, email: str, password: str, full_name: str = "", app_id: str = "",
+                                       idempotency_key: str | None = None) -> bool:
+        """Security personnel account created by the estate caretaker, with a temporary password."""
+        if not self.api_key:
+            logger.error("Security staff welcome email not sent: Resend credentials are missing")
+            return False
+        recipient = email
+        email, password, full_name, app_id = map(escape, (email, password, full_name, app_id))
+        email_data = {
+            "from": self.sender,
+            "to": [recipient],
+            "subject": "Your Resident Pass gate officer account",
+            "html": f"""
+                <h2>Welcome to Resident Pass</h2>
+                <p>Hello {full_name}, your estate caretaker has registered you as security personnel.</p>
+                <p><b>Estate App ID:</b> {app_id}</p>
+                <p><b>Login Email:</b> {email}</p>
+                <p><b>Temporary Password:</b> {password}</p>
+                <p>Sign in to the Residence app with this temporary password. You must choose a new password
+                before you can verify visitors at the gate.</p>
+            """,
+        }
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    f"{self.base_url}/emails", json=email_data,
+                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json",
+                             **({"Idempotency-Key": idempotency_key} if idempotency_key else {})},
+                    timeout=10.0)
+                response.raise_for_status()
+                return True
+            except Exception as e:
+                logger.error(f"Failed to send Resend security staff welcome email: {e}")
+                return False
+
     async def send_realtime_access_alert(self, email: str, title: str, message: str) -> bool:
         """Send a real-time gate entry / departure / security notification."""
         if not self.api_key:

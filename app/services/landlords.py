@@ -184,6 +184,8 @@ async def process_one(db):
             # Persist the account, token and encrypted credential before sending. A crash
             # retries the same credential and provider idempotency key.
             await db.commit()
+            from app.core.redis import invalidate_cached_user
+            await invalidate_cached_user(job.app_id, job.email)
             job = (await db.execute(select(Job).where(Job.id == job_id).with_for_update())).scalar_one()
         account = await db.get(User, job.user_id)
         if account and not account.must_change_password:

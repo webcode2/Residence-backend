@@ -143,32 +143,39 @@ async def visitor_history(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    from sqlalchemy import select
+    from sqlalchemy import select, or_
     from app.models.token import VisitorToken
-    from app.core.redis import get_token_live_status
+    from app.core.redis import get_token_live_statuses, get_cached_visitor_history, set_cached_visitor_history
     from app.services.history_policy import retention
     from app.models.base import utc_now
-    from datetime import timedelta
-    from sqlalchemy import or_
-    days,_=await retention(db,app_id)
-    cutoff=utc_now()-timedelta(days=days)
-    query = select(VisitorToken).where(VisitorToken.app_id == app_id,or_(
-        VisitorToken.status=='checked_in',VisitorToken.expires_at>=cutoff,VisitorToken.checked_out_at>=cutoff))
+    from datetime import datetime, timedelta
     staff = bool({UserRole.SECURITY, UserRole.CARETAKER}.intersection(current_user.roles))
-    if not staff:
-        query = query.where(VisitorToken.resident_id == current_user.id)
-    rows = (await db.execute(query.order_by(VisitorToken.created_at.desc()).limit(200))).scalars().all()
+    # Cache-aside for a resident's own list: Redis first; on a miss or after the TTL,
+    # load from Postgres and re-cache. Staff see the whole estate, so they always read Postgres.
+    rows = None if staff else await get_cached_visitor_history(app_id, str(current_user.id))
+    if rows is None:
+        days,_=await retention(db,app_id)
+        cutoff=utc_now()-timedelta(days=days)
+        query = select(VisitorToken).where(VisitorToken.app_id == app_id,or_(
+            VisitorToken.status=='checked_in',VisitorToken.expires_at>=cutoff,VisitorToken.checked_out_at>=cutoff))
+        if not staff:
+            query = query.where(VisitorToken.resident_id == current_user.id)
+        records = (await db.execute(query.order_by(VisitorToken.created_at.desc()).limit(200))).scalars().all()
+        rows = [VisitorTokenSchema.model_validate(r).model_dump(mode="json") for r in records]
+        if not staff:
+            await set_cached_visitor_history(app_id, str(current_user.id), rows)
+    # Gate check-in/out lands in Redis first; overlay it for every row in one MGET.
+    live_by_id = await get_token_live_statuses([row["id"] for row in rows])
     result = []
     for row in rows:
         item = VisitorTokenSchema.model_validate(row)
-        live = await get_token_live_status(str(row.id))
+        live = live_by_id.get(str(item.id))
         if live:
             item.status = live.get("status", item.status)
             for field in ("checked_in_at", "checked_out_at"):
                 if live.get(field):
-                    from datetime import datetime
                     setattr(item, field, datetime.fromisoformat(live[field]))
-        if staff and row.resident_id != current_user.id:
+        if staff and item.resident_id != current_user.id:
             # A generated passcode is private to the resident who made it: staff only see visitors
             # who actually came through the gate, and never the entry or book-out codes.
             if item.status == 'pending':

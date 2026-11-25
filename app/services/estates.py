@@ -111,6 +111,8 @@ async def register_new_estate(db: AsyncSession, reg_in: EstateRegistrationReques
             if _APP_ID_INDEX in str(error) and attempt < _APP_ID_ATTEMPTS - 1:
                 continue
             raise
+        from app.core.redis import invalidate_cached_user
+        await invalidate_cached_user(app_id, admin_user.email)
         return {
             "user": admin_user,
             "estate_name": new_estate.name,

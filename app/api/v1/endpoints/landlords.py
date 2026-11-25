@@ -180,6 +180,8 @@ async def create_landlord(
     except Exception:
         logger.warning("Failed to cache landlord onboarding status in Redis: job_id=%s", job_id, exc_info=True)
 
+    from app.core.redis import invalidate_cached_user
+    await invalidate_cached_user(app_id, user.email)  # never serve a stale profile for a re-used email
     await _wake_email_worker()
     return {
         "id": str(user.id),
@@ -438,8 +440,10 @@ async def resend_landlord_welcome(
         raise HTTPException(status_code=409, detail="Cannot resend welcome email for a revoked host / property owner")
 
     temp_password = secrets.token_urlsafe(14)
-    user.hashed_password = await get_password_hash_async(temp_password)
+    hashed_password = await get_password_hash_async(temp_password)
+    user.hashed_password = hashed_password
     user.must_change_password = True
+    user_id, user_email = user.id, user.email
 
     job_id = uuid.uuid4()
     now = utc_now()
@@ -463,10 +467,15 @@ async def resend_landlord_welcome(
         await db.commit()
     except Exception:
         await db.rollback()
+        # The rollback also discarded the new password; re-apply it, or the emailed
+        # temporary password would not work.
+        user = await db.get(User, user_id, populate_existing=True)
+        user.hashed_password = hashed_password
+        user.must_change_password = True
         existing_job = (await db.execute(
             select(LandlordOnboardingJob).where(
                 LandlordOnboardingJob.app_id == app_id,
-                LandlordOnboardingJob.email == user.email,
+                LandlordOnboardingJob.email == user_email,
             )
         )).scalar_one_or_none()
         if existing_job is None:
@@ -485,6 +494,9 @@ async def resend_landlord_welcome(
         existing_job.password_ciphertext = cipher().encrypt(temp_password.encode()).decode()
         await db.commit()
         job_id = existing_job.id
+
+    from app.core.redis import invalidate_cached_user
+    await invalidate_cached_user(app_id, user_email)  # password + must_change_password changed
 
     try:
         redis_client = get_redis_client()

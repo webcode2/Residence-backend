@@ -5,7 +5,8 @@ Google Cloud Tasks wakes it by POSTing /internal/drain (see app/services/worker_
 Cloud Run IAM only lets the tasks service account invoke it.
 
 Each drain request processes, until nothing is due:
-  * Redis queues: gate access logs, visitor-token state, chat messages
+  * Redis queues: notifications (FCM pushes, alert emails), gate access logs,
+    visitor-token state, chat messages
   * durable Postgres job tables: SOS push deliveries, host / property owner welcome
     emails, history exports / purges
 then schedules a wake for the earliest future retry, so retries happen without anything
@@ -62,6 +63,7 @@ async def _one_pass(totals: Counter) -> int:
     from app.services import history_jobs, landlords, sos
     from app.services.access_logs import drain_access_log_queue
     from app.services.chat import drain_chat_message_queue
+    from app.services.notification_queue import drain_notification_queue
     from app.services.token_state import drain_token_state_queue
 
     handled = 0
@@ -82,6 +84,7 @@ async def _one_pass(totals: Counter) -> int:
 
     # SOS first: it is the time-critical one.
     await run("sos_pushes", lambda: with_session(sos.drain))
+    await run("notifications", drain_notification_queue)
     await run("access_logs", lambda: with_session(drain_access_log_queue))
     await run("token_states", lambda: with_session(drain_token_state_queue))
     await run("chat_messages", lambda: with_session(drain_chat_message_queue))

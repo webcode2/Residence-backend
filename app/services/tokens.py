@@ -18,6 +18,7 @@ from app.core.redis import (
 )
 from datetime import datetime, timedelta, date, UTC
 from fastapi import HTTPException, status
+from app.services import notification_queue as notify_queue
 import asyncio
 import secrets
 import string
@@ -233,6 +234,8 @@ async def create_visitor_token(
     await db.commit()
     await db.refresh(db_obj)
 
+    from app.core.redis import invalidate_visitor_history
+    await invalidate_visitor_history(app_id, db_obj.resident_id)  # resident's cached list is now stale
     # Cache in Redis with 20-minute TTL for instant gate verification
     await cache_visitor_token(
         app_id=app_id,
@@ -306,6 +309,8 @@ async def create_bookout_token(
     token.bookout_expires_at = expires_at
     await db.commit()
     await db.refresh(token)
+    from app.core.redis import invalidate_visitor_history
+    await invalidate_visitor_history(app_id, token.resident_id)
 
     # Cache in Redis with 20-minute TTL for fast exit gate reader
     await cache_bookout_token(
@@ -403,12 +408,11 @@ async def direct_security_checkout(
     res_result = await db.execute(select(User).where(User.id == token.resident_id))
     resident = res_result.scalar_one_or_none()
     if resident and resident.email:
-        asyncio.create_task(
-            notification_service.send_realtime_access_alert(
-                resident.email,
-                f"Visitor Departed: {token.visitor_name}",
-                f"Security has checked out your visitor '{token.visitor_name}' at the exit gate at {now.strftime('%Y-%m-%d %H:%M:%S UTC')}."
-            )
+        await notify_queue.dispatch(
+            'email_alert',
+            email=resident.email,
+            title=f"Visitor Departed: {token.visitor_name}",
+            message=f"Security has checked out your visitor '{token.visitor_name}' at the exit gate at {now.strftime('%Y-%m-%d %H:%M:%S UTC')}.",
         )
 
     return {

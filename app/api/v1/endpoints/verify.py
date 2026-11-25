@@ -144,9 +144,11 @@ async def _notify_visitor_access(db, app_id, result):
         await record(db,resident.id,app_id,'access:'+notification_id,'Visitor departure' if result['action']=='book_out' else 'Visitor arrival',result.get('message','Visitor access updated'),{'type':'visitor_access','action':result['action'],'app_id':app_id})
         await db.commit()
     if resident and resident.fcm_token:
-        asyncio.create_task(fcm_service.send_to_token(
-            resident.fcm_token,
-            'Visitor departure' if result['action'] == 'book_out' else 'Visitor arrival',
-            result.get('message', 'Visitor access updated'),
+        from app.services import notification_queue as notify_queue
+        await notify_queue.dispatch(
+            'push',
+            token=resident.fcm_token,
+            title='Visitor departure' if result['action'] == 'book_out' else 'Visitor arrival',
+            body=result.get('message', 'Visitor access updated'),
             data={'type': 'visitor_access', 'action': result['action'], 'app_id': app_id, 'notification_count': await unread_count(db,resident.id,app_id)},
-        ))
+        )

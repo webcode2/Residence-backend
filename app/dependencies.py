@@ -20,7 +20,10 @@ from app.core.redis import (
     get_cached_user,
     set_cached_user,
     is_token_blacklisted,
+    user_cache_payload,
+    USER_CACHE_VERSION,
 )
+
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/v1/auth/login")
 
@@ -111,6 +114,8 @@ async def get_authenticated_user(
 
     # 2. Fast-path: Check Redis user profile cache
     cached_user = await get_cached_user(token_data.app_id, token_data.email)
+    if cached_user and cached_user.get("v") != USER_CACHE_VERSION:
+        cached_user = None  # older cache shape lacks profile fields; refresh from Postgres
     if cached_user and (payload.get("uid") or cached_user.get("created_at")):
         cached_identity = User(id=uuid.UUID(cached_user["id"]), created_at=datetime.fromisoformat(cached_user["created_at"]) if cached_user.get("created_at") else None)
         if not token_matches_user(payload, cached_identity):
@@ -133,7 +138,11 @@ async def get_authenticated_user(
             must_change_password=cached_user.get("must_change_password", False),
             is_revoked=cached_user.get("is_revoked", False),
             app_id=cached_user["app_id"],
-            landlord_id=uuid.UUID(cached_user["landlord_id"]) if cached_user.get("landlord_id") else None
+            landlord_id=uuid.UUID(cached_user["landlord_id"]) if cached_user.get("landlord_id") else None,
+            phone=cached_user.get("phone"),
+            invitation_id=uuid.UUID(cached_user["invitation_id"]) if cached_user.get("invitation_id") else None,
+            relationship_type=cached_user.get("relationship_type"),
+            created_at=datetime.fromisoformat(cached_user["created_at"]) if cached_user.get("created_at") else None,
         )
 
     # 3. Database Fallback on Cache Miss
@@ -155,21 +164,7 @@ async def get_authenticated_user(
     await set_cached_user(
         app_id=token_data.app_id,
         email=token_data.email,
-        user_data={
-            "id": str(user.id),
-            "created_at": user.created_at.isoformat(),
-            "email": user.email,
-            "full_name": user.full_name,
-            "hashed_password": user.hashed_password,
-            "roles": [r.value for r in user.roles],
-            "rfid_tag": user.rfid_tag,
-            "house_number": user.house_number,
-            "street_name": user.street_name,
-            "is_revoked": user.is_revoked,
-            "must_change_password": user.must_change_password,
-            "app_id": user.app_id,
-            "landlord_id": str(user.landlord_id) if user.landlord_id else None
-        },
+        user_data=user_cache_payload(user),
         ttl_seconds=1800
     )
 

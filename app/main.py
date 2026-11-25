@@ -174,6 +174,8 @@ app.include_router(subscriptions.router, prefix=f"{settings.API_V1_STR}/subscrip
 app.include_router(payments.router, prefix=f"{settings.API_V1_STR}/payments", tags=["payments"])
 app.include_router(access_logs.router, prefix=f"{settings.API_V1_STR}/access-logs", tags=["access_logs"])
 app.include_router(chat.router, prefix=f"{settings.API_V1_STR}/chat", tags=["chat"])
+from app.api.v1.endpoints import security_staff
+app.include_router(security_staff.router, prefix=f"{settings.API_V1_STR}/security-staff", tags=["security_staff"])
 from app.api.v1.endpoints import dashboard
 app.include_router(dashboard.router, prefix=f"{settings.API_V1_STR}/dashboard", tags=["estate_dashboard"])
 app.include_router(admin_router, prefix=f"{settings.API_V1_STR}/admin", tags=["saas_admin"])

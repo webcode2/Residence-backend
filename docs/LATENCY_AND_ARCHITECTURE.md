@@ -70,17 +70,39 @@ drains everything due (`app/worker_app.py`), schedules a wake for the next retry
 and scales back to zero. A 5-second Redis flag collapses bursts into one wake. Nothing
 runs, and nothing is billed, while there is no work.
 
-**Cached in Redis (read without touching Postgres):** signed-in user profile (used by
-every authenticated request), estate validity, subscription state, RFID lookups,
-visitor / registration / book-out tokens.
+Notifications follow the same path: gate arrival/departure pushes, RFID and visitor
+alert emails, chat FCM fallbacks, estate-settings sync pushes and security-staff welcome
+emails are pushed to the Redis list `residence:notify:queue` by
+`app/services/notification_queue.py` and sent by the worker (transient FCM failures are
+retried up to 3 times; stale device tokens are not). Without a worker configured
+(local / docker compose) they are sent before the request returns.
 
-## Known gaps against this architecture (not yet done)
+## Redis caching rules (cache-aside)
 
-1. Push notifications other than SOS (chat messages, gate entry/exit alerts, estate
-   settings sync) are sent with fire-and-forget tasks after the response. On Cloud Run
-   with request-only CPU these can be delayed until the next request. They should go
-   through the worker queue like SOS.
-2. `GET /users/me/profile` reads Postgres every time; it should serve the Redis-cached
-   profile (the cache lacks `phone`, `invitation_id`, `relationship_type` today).
-3. A user's most recent visitor tokens (`GET /tokens/visitor/active`) are read from
-   Postgres; they should be cached per user in Redis for a few minutes.
+Every cached read follows the same pattern:
+
+1. Read Redis first.
+2. On a miss (never cached, invalidated, or TTL expired) read Postgres, then write the
+   result back to Redis with its TTL.
+3. Every create, update or delete of the underlying data deletes the Redis entry
+   immediately after the Postgres commit, so the next read reloads fresh data.
+
+| Cached data | Key | TTL | Invalidated by |
+|---|---|---|---|
+| Signed-in user profile (also `GET /users/me/profile`) | `residence:user:{app_id}:{email}` | 30 min | account creation (all 5 paths), profile / password / status / role changes, deletion, resend-welcome |
+| A resident's visitor list (`GET /tokens/visitor/history`) | `residence:visitor_history:{app_id}:{user_id}` | 5 min | creating a visitor token, generating a book-out code |
+| Visitor token live status (check-in / check-out) | `residence:token_live_status:{token_id}` | 24 h | written by every gate check-in / check-out; overlaid on the cached list in one `MGET` |
+| Visitor / registration / book-out codes, RFID lookups, estate validity, subscription state | see `app/core/redis.py` | 20 min – 24 h | the matching create / revoke / update paths |
+
+The profile entry carries a version (`v`); entries in an older shape are treated as misses.
+Login, owner login and authentication all build it with `user_cache_payload()`.
+
+## Security personnel (gate officers)
+
+Caretakers register officers on the Admin **Security staff** page
+(`POST /api/v1/security-staff`). Only caretakers can create security accounts. A new
+officer receives a temporary password (shown once to the caretaker and emailed by the
+worker) and is blocked from every endpoint, including gate verification, until they set
+their own password. Caretakers can suspend or reinstate an officer
+(`PATCH /api/v1/users/{id}/status`, effective on the officer's next request) and reset
+their password (`POST /api/v1/security-staff/{id}/reset-password`).

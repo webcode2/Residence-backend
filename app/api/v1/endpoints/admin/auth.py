@@ -85,22 +85,11 @@ async def admin_login(
     )
 
     # Pre-warm Redis cache
+    from app.core.redis import user_cache_payload
     await set_cached_user(
         app_id=user.app_id,
         email=user.email,
-        user_data={
-            "id": str(user.id),
-            "email": user.email,
-            "full_name": user.full_name,
-            "hashed_password": user.hashed_password,
-            "roles": [role.value for role in user.roles],
-            "rfid_tag": user.rfid_tag,
-            "house_number": user.house_number,
-            "street_name": user.street_name,
-            "is_revoked": user.is_revoked,
-            "app_id": user.app_id,
-            "landlord_id": str(user.landlord_id) if user.landlord_id else None
-        },
+        user_data=user_cache_payload(user),
         ttl_seconds=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
     )
 

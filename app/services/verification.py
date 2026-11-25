@@ -1,4 +1,5 @@
 import asyncio
+from app.services import notification_queue as notify_queue
 import logging
 from dataclasses import dataclass
 from datetime import datetime, date, UTC
@@ -259,12 +260,11 @@ async def verify_rfid_access(db: AsyncSession, rfid_tag: str, app_id: str) -> Op
         )
 
         if sub.realtime_alerts_enabled and cached_user.get("email"):
-            asyncio.create_task(
-                notification_service.send_realtime_access_alert(
-                    cached_user["email"],
-                    "RFID Gate Entry Authorized",
-                    f"Your RFID tag was authorized for gate entry at {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}."
-                )
+            await notify_queue.dispatch(
+                'email_alert',
+                email=cached_user["email"],
+                title="RFID Gate Entry Authorized",
+                message=f"Your RFID tag was authorized for gate entry at {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}.",
             )
 
         return {
@@ -331,12 +331,11 @@ async def verify_rfid_access(db: AsyncSession, rfid_tag: str, app_id: str) -> Op
     )
 
     if sub.realtime_alerts_enabled and user.email:
-        asyncio.create_task(
-            notification_service.send_realtime_access_alert(
-                user.email,
-                "RFID Gate Entry Authorized",
-                f"Your RFID tag was authorized for gate entry at {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}."
-            )
+        await notify_queue.dispatch(
+            'email_alert',
+            email=user.email,
+            title="RFID Gate Entry Authorized",
+            message=f"Your RFID tag was authorized for gate entry at {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}.",
         )
 
     return {"status": "authorized", "user_id": str(user.id), "roles": roles}
@@ -397,12 +396,11 @@ async def verify_visitor_token(
                 res_result = await db.execute(select(User).where(User.id == resident_id))
                 resident = res_result.scalar_one_or_none()
                 if resident and resident.email:
-                    asyncio.create_task(
-                        notification_service.send_realtime_access_alert(
-                            resident.email,
-                            f"Visitor Checked Out: {visitor_name}",
-                            f"Visitor '{visitor_name}' has checked out and departed through the exit gate at {now.strftime('%Y-%m-%d %H:%M:%S UTC')}."
-                        )
+                    await notify_queue.dispatch(
+                        'email_alert',
+                        email=resident.email,
+                        title=f"Visitor Checked Out: {visitor_name}",
+                        message=f"Visitor '{visitor_name}' has checked out and departed through the exit gate at {now.strftime('%Y-%m-%d %H:%M:%S UTC')}.",
                     )
 
             return {
@@ -467,12 +465,11 @@ async def verify_visitor_token(
                 res_result = await db.execute(select(User).where(User.id == bookout_token.resident_id))
                 resident = res_result.scalar_one_or_none()
                 if resident and resident.email:
-                    asyncio.create_task(
-                        notification_service.send_realtime_access_alert(
-                            resident.email,
-                            f"Visitor Checked Out: {bookout_token.visitor_name}",
-                            f"Visitor '{bookout_token.visitor_name}' has checked out and departed through the exit gate at {now.strftime('%Y-%m-%d %H:%M:%S UTC')}."
-                        )
+                    await notify_queue.dispatch(
+                        'email_alert',
+                        email=resident.email,
+                        title=f"Visitor Checked Out: {bookout_token.visitor_name}",
+                        message=f"Visitor '{bookout_token.visitor_name}' has checked out and departed through the exit gate at {now.strftime('%Y-%m-%d %H:%M:%S UTC')}.",
                     )
 
             return {
@@ -530,12 +527,11 @@ async def verify_visitor_token(
                 res_result = await db.execute(select(User).where(User.id == resident_id))
                 resident = res_result.scalar_one_or_none()
                 if resident and resident.email:
-                    asyncio.create_task(
-                        notification_service.send_realtime_access_alert(
-                            resident.email,
-                            f"Visitor Arrived: {visitor_name}",
-                            f"Visitor '{visitor_name}' just arrived at the gate and checked in using visitor code {code}."
-                        )
+                    await notify_queue.dispatch(
+                        'email_alert',
+                        email=resident.email,
+                        title=f"Visitor Arrived: {visitor_name}",
+                        message=f"Visitor '{visitor_name}' just arrived at the gate and checked in using visitor code {code}.",
                     )
 
             return {
@@ -583,12 +579,11 @@ async def verify_visitor_token(
                 res_result = await db.execute(select(User).where(User.id == entry_token.resident_id))
                 resident = res_result.scalar_one_or_none()
                 if resident and resident.email:
-                    asyncio.create_task(
-                        notification_service.send_realtime_access_alert(
-                            resident.email,
-                            f"Visitor Arrived: {entry_token.visitor_name}",
-                            f"Visitor '{entry_token.visitor_name}' just arrived at the gate and checked in using visitor code {code}."
-                        )
+                    await notify_queue.dispatch(
+                        'email_alert',
+                        email=resident.email,
+                        title=f"Visitor Arrived: {entry_token.visitor_name}",
+                        message=f"Visitor '{entry_token.visitor_name}' just arrived at the gate and checked in using visitor code {code}.",
                     )
 
             return {

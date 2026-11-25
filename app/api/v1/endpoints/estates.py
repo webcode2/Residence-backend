@@ -57,7 +57,9 @@ async def update_estate_settings(
     from app.services import estate_settings_sync
     result = await estate_service.update_estate_settings(db, app_id, settings_in.token_code_length)
     tokens = await estate_settings_sync.recipients(db, app_id)
-    background_tasks.add_task(estate_settings_sync.notify, tokens, app_id)
+    from app.services import notification_queue as notify_queue
+    # Invalidation-only silent push; clients fetch the authoritative snapshot.
+    await notify_queue.dispatch('settings_sync', tokens=tokens, app_id=app_id)
     return result
 
 @router.get("/security-tips", response_model=list[dict], tags=["estates"])

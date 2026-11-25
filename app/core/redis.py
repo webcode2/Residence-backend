@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from datetime import date
 from app.core.config import settings
 
@@ -310,6 +310,31 @@ def _estate_cache_key(app_id: str) -> str:
 
 def _token_blacklist_key(token_hash: str) -> str:
     return f"residence:token_blacklist:{token_hash}"
+
+# Bump when the cached profile shape changes so older entries are treated as misses.
+USER_CACHE_VERSION = 2
+
+def user_cache_payload(user: Any) -> Dict[str, Any]:
+    """The one profile shape cached for authentication and GET /users/me/profile."""
+    return {
+        "v": USER_CACHE_VERSION,
+        "id": str(user.id),
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "email": user.email,
+        "full_name": user.full_name,
+        "phone": user.phone,
+        "hashed_password": user.hashed_password,
+        "roles": [getattr(r, "value", r) for r in user.roles],
+        "rfid_tag": user.rfid_tag,
+        "house_number": user.house_number,
+        "street_name": user.street_name,
+        "is_revoked": bool(user.is_revoked),
+        "must_change_password": bool(user.must_change_password),
+        "app_id": user.app_id,
+        "landlord_id": str(user.landlord_id) if user.landlord_id else None,
+        "invitation_id": str(user.invitation_id) if user.invitation_id else None,
+        "relationship_type": user.relationship_type,
+    }
 
 async def get_cached_user(app_id: str, email: str) -> Optional[Dict[str, Any]]:
     """Fetch cached user profile from Redis to avoid PostgreSQL queries on every API request."""
@@ -658,6 +683,68 @@ async def get_token_live_status(token_id: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.debug(f"Redis get_token_live_status error: {e}")
         return None
+
+async def get_token_live_statuses(token_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Live check-in/out status for many tokens in one round trip (MGET)."""
+    client = get_redis_client()
+    if not client or not token_ids:
+        return {}
+    try:
+        raws = await client.mget([_token_live_status_key(str(t)) for t in token_ids])
+    except Exception as e:
+        logger.debug(f"Redis get_token_live_statuses error: {e}")
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for token_id, raw in zip(token_ids, raws):
+        if raw:
+            try:
+                out[str(token_id)] = json.loads(raw)
+            except ValueError:
+                pass
+    return out
+
+# --- Per-resident visitor token list (cache-aside) ---
+# Holds a resident's recent visitor tokens so the home / visitors screens skip Postgres.
+# Cleared when the resident creates a token or a book-out code; check-in/out changes are
+# overlaid from the live-status keys on every read, so they never go stale here.
+VISITOR_HISTORY_TTL_SECONDS = 300
+
+def _visitor_history_key(app_id: str, user_id: str) -> str:
+    return f"residence:visitor_history:{app_id}:{user_id}"
+
+async def get_cached_visitor_history(app_id: str, user_id: str) -> Optional[List[Dict[str, Any]]]:
+    client = get_redis_client()
+    if not client:
+        return None
+    try:
+        raw = await client.get(_visitor_history_key(app_id, str(user_id)))
+        return json.loads(raw) if raw else None
+    except Exception as e:
+        logger.debug(f"Redis get_cached_visitor_history error: {e}")
+        return None
+
+async def set_cached_visitor_history(app_id: str, user_id: str, rows: List[Dict[str, Any]],
+                                     ttl_seconds: int = VISITOR_HISTORY_TTL_SECONDS) -> bool:
+    client = get_redis_client()
+    if not client:
+        return False
+    try:
+        await client.set(_visitor_history_key(app_id, str(user_id)), json.dumps(rows, default=str), ex=ttl_seconds)
+        return True
+    except Exception as e:
+        logger.debug(f"Redis set_cached_visitor_history error: {e}")
+        return False
+
+async def invalidate_visitor_history(app_id: str, user_id: Any) -> bool:
+    client = get_redis_client()
+    if not client or not user_id:
+        return False
+    try:
+        await client.delete(_visitor_history_key(app_id, str(user_id)))
+        return True
+    except Exception as e:
+        logger.debug(f"Redis invalidate_visitor_history error: {e}")
+        return False
 
 async def enqueue_token_state_update(payload: Dict[str, Any]) -> bool:
     """Queue a visitor token Postgres state transition for the worker."""

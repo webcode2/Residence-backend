@@ -42,6 +42,8 @@ from app.services.chat_websocket import ChatConnection, chat_hub
 
 logger = logging.getLogger(__name__)
 
+from app.services import notification_queue as notify_queue
+
 router = APIRouter()
 
 WS_CLOSE_UNAUTHORIZED = 4401
@@ -95,7 +97,7 @@ async def create_thread(
         actor=current_user, actor_role=chat_service.ROLE_RESIDENT,
     )
     await chat_service.broadcast(plan)
-    background_tasks.add_task(chat_service.send_push_notifications, plan)
+    await notify_queue.dispatch('chat_push', dispatch=plan)  # FCM fallback is sent by the worker
     return _detail_schema(thread, [message])
 
 
@@ -127,8 +129,7 @@ async def get_thread(
     thread, messages, role, marked = await chat_service.get_thread_detail(db, current_user, thread_id)
     if marked:
         thread_payload = chat_service.thread_to_schema(thread).model_dump(mode="json")
-        background_tasks.add_task(
-            _publish_read_receipt,
+        await _publish_read_receipt(  # fast Redis publish: done before responding
             str(thread.app_id),
             str(thread.id),
             str(thread.resident_id),
@@ -152,7 +153,7 @@ async def resolve_thread(
         actor=current_user, actor_role=role,
     )
     await chat_service.broadcast(plan)
-    background_tasks.add_task(chat_service.send_push_notifications, plan)
+    await notify_queue.dispatch('chat_push', dispatch=plan)  # FCM fallback is sent by the worker
     return chat_service.thread_to_schema(thread)
 
 
@@ -173,7 +174,7 @@ async def send_message(
         actor=current_user, actor_role=role,
     )
     await chat_service.broadcast(plan)
-    background_tasks.add_task(chat_service.send_push_notifications, plan)
+    await notify_queue.dispatch('chat_push', dispatch=plan)  # FCM fallback is sent by the worker
     return chat_service.message_to_schema(message)
 
 
