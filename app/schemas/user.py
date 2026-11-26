@@ -25,6 +25,7 @@ class ResidentRegistrationSchema(UserCreateSchema):
 
 class UserUpdateSchema(BaseModel):
     email: Optional[EmailStr] = None
+    phone: Optional[str] = Field(None, max_length=40)
     full_name: Optional[str] = None
     roles: Optional[List[UserRole]] = None
     rfid_tag: Optional[str] = None
@@ -33,6 +34,7 @@ class UserUpdateSchema(BaseModel):
     fcm_token: Optional[str] = None
     is_revoked: Optional[bool] = None
     password: Optional[str] = None
+    reset_password: bool = False
 
 class FCMTokenUpdateSchema(BaseModel):
     fcm_token: str
@@ -47,6 +49,15 @@ class UserSchema(UserBaseSchema):
     created_at: datetime
     
     model_config = ConfigDict(from_attributes=True)
+
+class PasswordResetJobSchema(BaseModel):
+    id: uuid.UUID
+    status: str
+
+
+class UserUpdateResponseSchema(UserSchema):
+    password_reset: PasswordResetJobSchema | None = None
+
 
 class LoginRequestSchema(BaseModel):
     email: EmailStr

@@ -7,7 +7,7 @@ from typing import Optional, Any
 import uuid
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -29,6 +29,7 @@ from app.core.redis import (
     is_token_code_claimed,
     claim_token_code,
     get_token_live_status,
+    get_verification_code_cache_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -609,3 +610,49 @@ async def verify_visitor_token(
 async def verify_bookout_token(db: AsyncSession, code: str, app_id: str) -> Optional[dict]:
     """Alias for backwards compatibility and dedicated exit barrier hardware."""
     return await verify_visitor_token(db, code, app_id, direction="exit")
+
+async def classify_denied_token(db: AsyncSession, app_id: str, code: str) -> str:
+    """Classify a failed verification using the records still available for this estate."""
+    code = code.strip().upper()
+    cached = await get_verification_code_cache_state(app_id, code)
+    if cached == "claimed":
+        return "token_claimed"
+    if cached == "present":
+        return "token_denied"
+
+    result = await db.execute(
+        select(
+            VisitorToken.code,
+            VisitorToken.status,
+            VisitorToken.is_used,
+            VisitorToken.expires_at,
+            VisitorToken.bookout_code,
+            VisitorToken.bookout_expires_at,
+        ).where(
+            VisitorToken.app_id == app_id,
+            or_(VisitorToken.code == code, VisitorToken.bookout_code == code),
+        )
+    )
+    records = result.all()
+    if not records:
+        # A historical code may have been removed by retention or exit-code cleanup.
+        return "token_not_found" if cached == "absent" else "token_denied"
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    outcomes = set()
+    for row in records:
+        if row.code == code:
+            if row.is_used or row.status in ("checked_in", "checked_out"):
+                outcomes.add("token_used")
+            elif row.expires_at <= now:
+                outcomes.add("token_expired")
+            else:
+                outcomes.add("token_denied")
+        if row.bookout_code == code:
+            if row.status == "checked_out":
+                outcomes.add("token_used")
+            elif row.bookout_expires_at is not None and row.bookout_expires_at <= now:
+                outcomes.add("token_expired")
+            else:
+                outcomes.add("token_denied")
+    return next(iter(outcomes)) if len(outcomes) == 1 else "token_denied"

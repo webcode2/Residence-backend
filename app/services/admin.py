@@ -315,6 +315,8 @@ async def set_user_revocation_admin(db: AsyncSession, user_id: uuid.UUID, is_rev
 
     if UserRole.SAAS_OWNER in user.roles:
         raise HTTPException(status_code=403, detail="Platform-owner accounts cannot be revoked through tenant user management")
+    if user.archived_at is not None and not is_revoked:
+        raise HTTPException(status_code=409, detail="Archived accounts require archive review")
     previous = user.is_revoked
     user.is_revoked = is_revoked
     if actor:

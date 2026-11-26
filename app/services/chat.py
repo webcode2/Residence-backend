@@ -485,6 +485,11 @@ async def send_message(
     thread, role = await get_thread_for_user(db, user, thread_id)
     if thread.status == "closed":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This chat thread is closed")
+    if role == ROLE_SECURITY and thread.status == "resolved":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This chat has been resolved. Only the resident can reopen it.",
+        )
 
     text = data.message.strip()
     if not text:

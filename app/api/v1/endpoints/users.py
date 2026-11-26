@@ -1,8 +1,9 @@
+from app.services.account_archive import ARCHIVE_RETENTION
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 from app.core.database import get_db
-from app.schemas.user import UserSchema, UserCreateSchema, ResidentRegistrationSchema, SelfProfileUpdateSchema, AuthResponseSchema, UserUpdateSchema, FCMTokenUpdateSchema
+from app.schemas.user import PasswordResetJobSchema, UserUpdateResponseSchema, UserSchema, UserCreateSchema, ResidentRegistrationSchema, SelfProfileUpdateSchema, AuthResponseSchema, UserUpdateSchema, FCMTokenUpdateSchema
 from app.schemas.estate import EstateRegistrationRequestSchema, EstateRegistrationResponseSchema
 from app.services import users as user_service, estates as estate_service
 from app.dependencies import validate_tenant, check_roles, get_current_user, check_user_access, oauth2_scheme
@@ -138,6 +139,177 @@ async def list_users(
 ):
     return await user_service.get_users_by_tenant(db, app_id)
 
+@router.get("/archive", tags=["users"])
+async def list_archived_accounts(
+    app_id: str = Depends(validate_tenant),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(check_roles([UserRole.CARETAKER])),
+):
+    from sqlalchemy import select
+    from app.models.sos import AppNotification
+    from app.models.user import User
+
+    requests = (await db.execute(select(AppNotification.data, AppNotification.created_at).where(
+        AppNotification.app_id == app_id, AppNotification.user_id == current_user.id,
+        AppNotification.data["type"].as_string() == "archive_reinstatement",
+    ).order_by(AppNotification.created_at))).all()
+    latest_request = {data.get("archived_user_id"): created_at for data, created_at in requests}
+    rows = (await db.execute(select(User).where(
+        User.app_id == app_id, User.archived_at.is_not(None),
+    ).order_by(User.archived_at.desc(), User.id))).scalars()
+    return [{"id": row.id, "full_name": row.full_name or row.archive_email or row.email,
+             "email": row.archive_email or row.email, "archived_at": row.archived_at.isoformat() + "Z",
+             "reinstatement_requested": bool(latest_request.get(str(row.id)) and
+                 latest_request[str(row.id)] >= row.archived_at),
+             "hold_at": (row.archive_hold_at.isoformat() + "Z") if row.archive_hold_at else None,
+             "retention_deadline": (row.archived_at + ARCHIVE_RETENTION).isoformat() + "Z"}
+            for row in rows]
+
+
+@router.patch("/{user_id}/archive", tags=["users"])
+async def archive_account(
+    user_id: uuid.UUID,
+    app_id: str = Depends(validate_tenant),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(check_roles([UserRole.CARETAKER])),
+):
+    from sqlalchemy import select
+    from app.models.base import utc_now
+    from app.models.user import User
+    from app.core.redis import invalidate_cached_user, invalidate_cached_rfid_user
+
+    user = (await db.execute(select(User).where(
+        User.id == user_id, User.app_id == app_id,
+    ).with_for_update())).scalar_one_or_none()
+    if not user or not set(user.roles).intersection({UserRole.LANDLORD, UserRole.RESIDENT}):
+        raise HTTPException(404, detail="Directory account not found")
+    if user.id == current_user.id or UserRole.SAAS_OWNER in user.roles:
+        raise HTTPException(403, detail="This account cannot be archived from the directory")
+    if user.archived_at is None:
+        user.archived_at = utc_now()
+        user.is_revoked = True
+        user.fcm_token = None
+        await db.commit()
+        await invalidate_cached_user(app_id, user.email)
+        await invalidate_cached_rfid_user(app_id, user.rfid_tag)
+        if UserRole.LANDLORD in user.roles:
+            dependents = (await db.execute(select(User).where(
+                User.app_id == app_id, User.landlord_id == user.id,
+            ))).scalars()
+            for dependent in dependents:
+                await invalidate_cached_user(app_id, dependent.email)
+                await invalidate_cached_rfid_user(app_id, dependent.rfid_tag)
+        from datetime import timedelta
+        from app.services.worker_wake import wake_worker
+        # Keep the initial wake within Cloud Tasks' scheduling horizon.
+        await wake_worker("archive_purge", at=user.archived_at + timedelta(days=29))
+    return {"status": "archived", "message": "Account moved to Archive."}
+
+
+@router.patch("/{user_id}/archive/hold", tags=["users"])
+async def hold_archived_account(
+    user_id: uuid.UUID,
+    app_id: str = Depends(validate_tenant),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(check_roles([UserRole.CARETAKER])),
+):
+    from sqlalchemy import select
+    from app.models.admin_audit import AdminAuditLog
+    from app.models.base import utc_now
+    from app.models.user import User
+
+    user = (await db.execute(select(User).where(
+        User.id == user_id, User.app_id == app_id, User.archived_at.is_not(None),
+    ).with_for_update())).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(404, detail="Archived account not found")
+    if user.archive_hold_at is not None:
+        return {"status": "held"}
+    now = utc_now()
+    if now >= user.archived_at + ARCHIVE_RETENTION:
+        raise HTTPException(409, detail="The 30-day retention window has ended")
+    from app.core.redis import invalidate_cached_user
+
+    user.archive_email = user.email
+    user.email = f"archived-{user.id}@archive.residentpass.com"
+    user.archive_hold_at = now
+    db.add(AdminAuditLog(
+        actor_id=current_user.id, actor_email=current_user.email,
+        action="user.archive_hold", target_type="user", target_id=str(user.id),
+        changes={"app_id": app_id},
+    ))
+    await db.commit()
+    await invalidate_cached_user(app_id, user.archive_email)
+    return {"status": "held"}
+
+
+@router.patch("/{user_id}/archive/reinstate", tags=["users"])
+async def reinstate_archived_account(
+    user_id: uuid.UUID,
+    app_id: str = Depends(validate_tenant),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(check_roles([UserRole.CARETAKER])),
+):
+    from sqlalchemy import func, select
+    from sqlalchemy.exc import IntegrityError
+    from app.core.redis import invalidate_cached_user, invalidate_cached_rfid_user
+    from app.models.admin_audit import AdminAuditLog
+    from app.models.base import utc_now
+    from app.models.user import User
+
+    user = (await db.execute(select(User).where(
+        User.id == user_id, User.app_id == app_id, User.archived_at.is_not(None),
+    ).with_for_update())).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(404, detail="Archived account not found")
+    if utc_now() >= user.archived_at + ARCHIVE_RETENTION:
+        raise HTTPException(409, detail="The 30-day reinstatement window has ended")
+    original_email = user.archive_email or user.email
+    conflicting = await db.scalar(select(User.id).where(
+        User.app_id == app_id, User.id != user.id,
+        func.lower(User.email) == original_email.lower(),
+    ).limit(1))
+    if conflicting:
+        raise HTTPException(409, detail="A new estate account already uses this email")
+    user.email = original_email
+    user.archive_email = None
+    user.archived_at = None
+    user.archive_hold_at = None
+    user.is_revoked = False
+    rfid_tag = user.rfid_tag
+    db.add(AdminAuditLog(
+        actor_id=current_user.id, actor_email=current_user.email,
+        action="user.archive_reinstated", target_type="user", target_id=str(user.id),
+        changes={"app_id": app_id},
+    ))
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(409, detail="A new estate account already uses this email")
+    await invalidate_cached_user(app_id, original_email)
+    await invalidate_cached_rfid_user(app_id, rfid_tag)
+    return {"status": "reinstated"}
+
+
+@router.get("/password-resets/{job_id}", response_model=PasswordResetJobSchema, tags=["users"])
+async def password_reset_status(
+    job_id: uuid.UUID,
+    app_id: str = Depends(validate_tenant),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(check_roles([UserRole.CARETAKER])),
+):
+    from sqlalchemy import select
+    from app.models.onboarding import AccountPasswordResetJob
+
+    job = await db.scalar(select(AccountPasswordResetJob).where(
+        AccountPasswordResetJob.id == job_id, AccountPasswordResetJob.app_id == app_id,
+    ))
+    if not job:
+        raise HTTPException(404, detail="Password reset request not found")
+    return {"id": job.id, "status": job.status}
+
+
 @router.get("/{user_id}", response_model=UserSchema, tags=["profiling"])
 async def get_user(
     user_id: uuid.UUID,
@@ -154,7 +326,7 @@ async def get_user(
         )
     return user
 
-@router.patch("/{user_id}", response_model=UserSchema, tags=["profiling"])
+@router.patch("/{user_id}", response_model=UserUpdateResponseSchema, tags=["profiling"])
 async def update_user(
     user_id: uuid.UUID,
     user_in: UserUpdateSchema,
@@ -167,19 +339,31 @@ async def update_user(
             raise HTTPException(status_code=403, detail="You can only update your own profile")
         if user_in.model_fields_set - {"full_name", "password"}:
             raise HTTPException(status_code=403, detail="Only caretakers can change estate account permissions and identity")
+    if user_in.password is not None and current_user.id != user_id:
+        raise HTTPException(422, detail="Use the generated password reset for another account")
+    if user_in.reset_password:
+        target = await user_service.get_user(db, user_id, app_id)
+        if target is None:
+            raise HTTPException(404, detail="User not found")
+        if target.id == current_user.id or UserRole.SAAS_OWNER in target.roles:
+            raise HTTPException(403, detail="This account cannot be reset from the directory")
+        if user_in.password is not None:
+            raise HTTPException(422, detail="Do not supply a password for a generated reset")
     if user_in.roles is not None and UserRole.SAAS_OWNER in user_in.roles:
         raise HTTPException(status_code=403, detail="Platform owner roles cannot be assigned by estate accounts")
     if user_in.roles is not None and UserRole.LANDLORD in user_in.roles:
         target = await user_service.get_user(db, user_id, app_id)
         if target and UserRole.LANDLORD not in target.roles:
             raise HTTPException(status_code=409, detail="Hosts / Property Owners must be onboarded through the caretaker import queue")
-    user = await user_service.update_user(db, user_id, user_in, app_id)
+    user, reset_job = await user_service.update_user(db, user_id, user_in, app_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
         )
-    return user
+    return UserUpdateResponseSchema(
+        **UserSchema.model_validate(user).model_dump(), password_reset=reset_job,
+    )
 
 @router.delete("/{user_id}", tags=["users"])
 async def delete_user(
@@ -220,6 +404,8 @@ async def set_user_status(
         raise HTTPException(status_code=403, detail="Platform owner accounts cannot be managed here")
     if target.id == current_user.id:
         raise HTTPException(status_code=409, detail="You cannot change your own account status")
+    if target.archived_at is not None:
+        raise HTTPException(409, detail="Archived accounts cannot be changed here")
     target.is_revoked = body["is_revoked"]
     if body["is_revoked"]:
         target.fcm_token = None

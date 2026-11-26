@@ -422,6 +422,13 @@ async def test_resolve_and_reopen(client, estate, db_session, push_mock):
     assert resp.json()["has_active_emergency"] is False
     assert resp.json()["last_message_text"] == "Marked as resolved by Officer James (Main Gate Alpha)"
 
+    blocked = await client.post(
+        f"/api/v1/chat/threads/{thread['id']}/messages", json={"message": "One more update from the gate"},
+        headers=estate.headers("guard1"),
+    )
+    assert blocked.status_code == 409
+    assert "resident can reopen" in blocked.json()["detail"]
+
     resp = await client.post(
         f"/api/v1/chat/threads/{thread['id']}/messages", json={"message": "Actually, one more thing"},
         headers=estate.headers("resident"),
@@ -522,6 +529,28 @@ async def test_websocket_resident_cannot_join_foreign_thread(client, estate, pus
     await chat_websocket(ws, token=estate.token("resident2"))
     assert ws.replies("error")[0]["status_code"] == 404
     assert await presence_store.get_active_room(estate.users["resident2"].id) is None
+
+
+async def test_websocket_guard_cannot_send_after_resolve(client, estate, push_mock):
+    main = await create_gate(client, estate, "Main Gate Alpha", "GATE-A")
+    await go_on_duty(client, estate, "guard1", main["id"], "GH-04")
+    thread = await open_thread(client, estate)
+    assert (await client.post(
+        f"/api/v1/chat/threads/{thread['id']}/resolve",
+        headers=estate.headers("guard1"),
+    )).status_code == 200
+
+    ws = FakeWebSocket([{
+        "action": "send_message",
+        "thread_id": thread["id"],
+        "text": "One more update from the gate",
+    }])
+    await chat_websocket(ws, token=estate.token("guard1"))
+
+    error = ws.replies("error")[0]
+    assert error["status_code"] == 409
+    assert "resident can reopen" in error["detail"]
+    assert ws.replies("message_sent") == []
 
 
 @pytest.mark.asyncio

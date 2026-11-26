@@ -5,7 +5,7 @@ from app.models.estate import Estate
 from app.models.user import User, UserRole
 from app.models.sos import PushDevice
 from app.services.auth import create_access_token
-from app.services import estate_settings_sync
+from app.services import notification_queue
 from app.services.fcm import fcm_service
 
 @pytest.mark.asyncio
@@ -22,17 +22,18 @@ async def test_snapshot_and_admin_invalidation_are_estate_scoped(client, db_sess
     await db_session.commit()
     def headers(user):return {'X-App-Id':user.app_id,'Authorization':'Bearer '+create_access_token({'sub':user.email,'uid':str(user.id),'app_id':user.app_id})}
     notify=AsyncMock()
-    monkeypatch.setattr(estate_settings_sync,'notify',notify)
+    monkeypatch.setattr(notification_queue, 'dispatch', notify)
     for user in users[:3]:
         response=await client.get('/api/v1/estates/mobile-settings',headers=headers(user))
         assert response.status_code==200,response.text
-        assert response.json()=={'app_id':app_id,'token_code_length':6}
+        assert response.json()=={'app_id':app_id,'estate_name':'Sync','token_code_length':6}
     denied=await client.patch('/api/v1/estates/settings',headers=headers(users[1]),json={'token_code_length':4})
     assert denied.status_code==403
     saved=await client.patch('/api/v1/estates/settings',headers=headers(users[0]),json={'token_code_length':4})
     assert saved.status_code==200,saved.text
-    assert set(notify.call_args.args[0])=={'sync-device-0','sync-device-1','sync-device-2'}
-    assert notify.call_args.args[1]==app_id
+    assert notify.call_args.args == ('settings_sync',)
+    assert set(notify.call_args.kwargs['tokens']) == {'sync-device-0','sync-device-1','sync-device-2'}
+    assert notify.call_args.kwargs['app_id'] == app_id
     fresh=await client.get('/api/v1/estates/mobile-settings',headers=headers(users[2]))
     assert fresh.json()['token_code_length']==4
     crossed=await client.get('/api/v1/estates/mobile-settings',headers={**headers(users[3]),'X-App-Id':app_id})

@@ -78,6 +78,7 @@ async def test_verify_token_expired(client, db_session, guard_headers):
     
     assert response.status_code == 401
     assert "expired" in response.json()["detail"].lower()
+    assert response.headers["X-Residence-Verification-Result"] == "token_expired"
 
 
 @pytest.mark.asyncio
@@ -121,31 +122,83 @@ async def test_code_uniqueness_enforcement(client, db_session, guard_headers):
 
 
 @pytest.mark.asyncio
-async def test_verification_rate_limiting_after_5_failures(client, db_session, guard_headers):
-    """Ensure 5 consecutive failed verification attempts temporarily blocks the gate terminal (429)."""
-    estate_id = uuid.uuid4()
-    app_id = f"RP-{estate_id.hex[:5].upper()}"
-    estate = Estate(id=estate_id, app_id=app_id, name="Rate Limit Estate")
+async def test_unrelated_misses_do_not_block_entry_or_exit(client, db_session, guard_headers):
+    from app.core.redis import cache_bookout_token, get_verification_code_cache_state
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    estate = Estate(app_id=f"VERIFY-{uuid.uuid4().hex[:8]}", name="Verification Estate")
     db_session.add(estate)
-    sub = Subscription(estate_id=estate_id, status="active", expiry_date=(datetime.now(UTC).replace(tzinfo=None) + timedelta(days=30)).date())
-    db_session.add(sub)
+    await db_session.flush()
+    db_session.add(Subscription(
+        estate_id=estate.id, status="active",
+        expiry_date=(now + timedelta(days=1)).date(),
+    ))
+    resident = User(
+        email="guest-host@example.com", hashed_password="unused",
+        roles=[UserRole.RESIDENT], app_id=estate.app_id,
+    )
+    db_session.add(resident)
+    await db_session.flush()
+
+    def token(code, **options):
+        fields = {
+            "resident_id": resident.id, "visitor_name": "Guest",
+            "app_id": estate.app_id, "expires_at": now + timedelta(hours=1),
+        }
+        return VisitorToken(code=code, **(fields | options))
+
+    entry = token("0A1234")
+    exit_pass = token(
+        "0B1234", status="checked_in", is_used=True, bookout_code="0C1234",
+        bookout_expires_at=now + timedelta(hours=1),
+    )
+    expired_exit = token(
+        "0D1234", status="checked_in", is_used=True, bookout_code="0E1234",
+        bookout_expires_at=now - timedelta(minutes=1),
+    )
+    db_session.add_all([entry, exit_pass, expired_exit])
     await db_session.commit()
+    headers = await guard_headers(estate.app_id)
+    other_guard = await guard_headers(estate.app_id)
 
-    headers = await guard_headers(app_id)
+    assert await get_verification_code_cache_state(estate.app_id, entry.code) == "absent"
+    assert await cache_bookout_token(estate.app_id, exit_pass.bookout_code, {
+        "token_id": str(exit_pass.id), "resident_id": str(resident.id),
+        "visitor_name": exit_pass.visitor_name,
+    })
+    assert await get_verification_code_cache_state(estate.app_id, exit_pass.bookout_code) == "present"
 
-    # Attempts 1 to 4: Should return 401 Unauthorized with remaining attempts
-    for i in range(1, 5):
-        resp = await client.get(f"/api/v1/verify/token/000{i}", headers=headers)
-        assert resp.status_code == 401
-        assert "attempts remaining" in resp.json()["detail"].lower()
+    result_header = "X-Residence-Verification-Result"
+    for code in ("0001", "0002", "0003", "0004", "0005", "0006"):
+        missing = await client.get(f"/api/v1/verify/token/{code}", headers=headers)
+        assert missing.status_code == 401
+        assert missing.headers[result_header] == "token_not_found"
+        assert missing.json()["detail"] == "Token not found"
+        assert missing.json()["status_code"] == 401
+        assert missing.json()["request_id"]
 
-    # Attempt 5: Reaches threshold and triggers temporary block (429)
-    resp_5 = await client.get("/api/v1/verify/token/0005", headers=headers)
-    assert resp_5.status_code == 429
-    assert "temporarily blocked" in resp_5.json()["detail"].lower()
+    wrong_lane = await client.get(
+        "/api/v1/verify/token/0C1234?direction=entry", headers=headers,
+    )
+    assert wrong_lane.status_code == 401
+    assert wrong_lane.headers[result_header] == "token_denied"
+    assert await get_verification_code_cache_state(estate.app_id, "0C1234") == "present"
+    assert await get_verification_code_cache_state("OTHER-ESTATE", "0C1234") == "absent"
 
-    # Attempt 6 (while blocked): Immediate 429 Too Many Requests
-    resp_6 = await client.get("/api/v1/verify/token/0006", headers=headers)
-    assert resp_6.status_code == 429
-    assert "blocked" in resp_6.json()["detail"].lower()
+    expired = await client.get("/api/v1/verify/book-out/0E1234", headers=headers)
+    assert expired.status_code == 401
+    assert expired.headers[result_header] == "token_expired"
+    used = await client.get("/api/v1/verify/token/0D1234", headers=headers)
+    assert used.status_code == 401
+    assert used.headers[result_header] == "token_used"
 
+    checked_in = await client.get("/api/v1/verify/token/0a1234", headers=other_guard)
+    assert checked_in.status_code == 200
+    assert checked_in.json()["action"] == "check_in"
+    repeated = await client.get("/api/v1/verify/token/0A1234", headers=other_guard)
+    assert repeated.status_code == 401
+    assert repeated.headers[result_header] == "token_claimed"
+
+    checked_out = await client.get("/api/v1/verify/book-out/0C1234", headers=other_guard)
+    assert checked_out.status_code == 200
+    assert checked_out.json()["action"] == "book_out"

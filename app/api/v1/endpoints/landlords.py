@@ -213,7 +213,7 @@ async def resident_directory(
     from app.services.tokens import generate_registration_code
     from app.core.redis import cache_registration_token
 
-    users = (await db.execute(select(User).where(User.app_id == app_id).order_by(User.full_name, User.id))).scalars().all()
+    users = (await db.execute(select(User).where(User.app_id == app_id, User.archived_at.is_(None)).order_by(User.full_name, User.id))).scalars().all()
     tokens = (await db.execute(select(RegistrationToken).where(
         RegistrationToken.app_id == app_id, RegistrationToken.is_used.is_(False), RegistrationToken.is_revoked.is_(False),
         RegistrationToken.expires_at > utc_now()
@@ -262,8 +262,25 @@ async def resident_directory(
             except Exception:
                 pass
 
+    from app.models.onboarding import AccountPasswordResetJob
+    reset_rows = (await db.execute(select(
+        AccountPasswordResetJob.user_id, AccountPasswordResetJob.id, AccountPasswordResetJob.status,
+    ).where(AccountPasswordResetJob.app_id == app_id)
+     .distinct(AccountPasswordResetJob.user_id)
+     .order_by(AccountPasswordResetJob.user_id, AccountPasswordResetJob.created_at.desc(),
+               AccountPasswordResetJob.id.desc()))).all()
+    reset_jobs = {user_id: {"id": job_id, "status": state} for user_id, job_id, state in reset_rows}
+    retained_emails = {
+        email.lower() for email in (await db.execute(select(User.archive_email).where(
+            User.app_id == app_id, User.archive_hold_at.is_not(None),
+            User.archive_email.is_not(None),
+        ))).scalars()
+    }
+    directory_ids = {user.id for user in users}
     return [{
         'id': user.id, 'full_name': user.full_name or user.email, 'email': user.email,
+        'returning_user': user.email.lower() in retained_emails,
+        'password_reset': reset_jobs.get(user.id),
         'phone': user.phone, 'must_change_password': user.must_change_password, 'landlord_id': user.landlord_id,
         'house_number': user.house_number, 'street_name': user.street_name,
         'registration_token': latest.get(user.id, ''),
@@ -271,9 +288,11 @@ async def resident_directory(
         'type': 'permanent' if UserRole.LANDLORD in user.roles else 'tenant',
         'occupants': [{'id': occupant.id, 'full_name': occupant.full_name or occupant.email,
             'email': occupant.email, 'phone': occupant.phone, 'landlord_id': occupant.landlord_id,
+            'returning_user': occupant.email.lower() in retained_emails,
+            'password_reset': reset_jobs.get(occupant.id),
             'invitation_id': occupant.invitation_id, 'relationship_type': occupant.relationship_type, 'roles': occupant.roles, 'is_revoked': occupant.is_revoked}
             for occupant in users if occupant.landlord_id == user.id],
-    } for user in users if (UserRole.LANDLORD in user.roles or UserRole.RESIDENT in user.roles) and user.landlord_id is None]
+    } for user in users if (UserRole.LANDLORD in user.roles or UserRole.RESIDENT in user.roles) and (user.landlord_id is None or user.landlord_id not in directory_ids)]
 
 @router.post('/import-file', response_model=List[LandlordImportResponseSchema])
 async def import_landlord_file(file: UploadFile = File(...), app_id: str = Depends(validate_tenant),

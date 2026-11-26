@@ -105,12 +105,19 @@ async def get_users_by_tenant(db: AsyncSession, app_id: str) -> List[User]:
     result = await db.execute(select(User).where(User.app_id == app_id))
     return list(result.scalars().all())
 
-async def update_user(db: AsyncSession, user_id: uuid.UUID, user_in: UserUpdateSchema, app_id: str) -> Optional[User]:
-    db_obj = await get_user(db, user_id, app_id)
+async def update_user(db: AsyncSession, user_id: uuid.UUID, user_in: UserUpdateSchema, app_id: str):
+    db_obj = await db.scalar(select(User).where(
+        User.id == user_id, User.app_id == app_id,
+    ).with_for_update())
     if not db_obj:
-        return None
-    
+        return None, None
+
+    if db_obj.archived_at is not None:
+        from fastapi import HTTPException
+        raise HTTPException(409, "Archived accounts cannot be edited")
+
     update_data = user_in.model_dump(exclude_unset=True)
+    reset_password = update_data.pop("reset_password", False)
     if "password" in update_data:
         update_data["hashed_password"] = await get_password_hash_async(update_data.pop("password"))
 
@@ -119,6 +126,12 @@ async def update_user(db: AsyncSession, user_id: uuid.UUID, user_in: UserUpdateS
     for field, value in update_data.items():
         setattr(db_obj, field, value)
         
+    job_status = None
+    if reset_password:
+        from app.services.account_password_resets import queue_reset
+        job = await queue_reset(db, db_obj)
+        job_status = {"id": str(job.id), "status": job.status}
+
     await db.commit()
     await db.refresh(db_obj)
 
@@ -131,12 +144,20 @@ async def update_user(db: AsyncSession, user_id: uuid.UUID, user_in: UserUpdateS
     if db_obj.rfid_tag and db_obj.rfid_tag != old_rfid:
         await invalidate_cached_rfid_user(app_id, db_obj.rfid_tag)
 
-    return db_obj
+    if job_status is not None:
+        from app.services.worker_wake import wake_worker
+        await wake_worker("account_password_reset")
+
+    return db_obj, job_status
 
 async def delete_user(db: AsyncSession, user_id: uuid.UUID, app_id: str):
     db_obj = await get_user(db, user_id, app_id)
     if not db_obj:
         return None
+
+    if db_obj.archived_at is not None:
+        from fastapi import HTTPException
+        raise HTTPException(409, "Archived accounts are managed by the estate archive")
 
     email = db_obj.email
     rfid_tag = db_obj.rfid_tag

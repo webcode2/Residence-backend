@@ -1,6 +1,7 @@
 import enum
 import uuid
-from sqlalchemy import String, Boolean, ForeignKey, Index, Enum
+from datetime import datetime
+from sqlalchemy import DateTime, String, Boolean, ForeignKey, Index, Enum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import ARRAY
 from app.models.base import Base, ModelMixin, TenantMixin
@@ -19,6 +20,9 @@ class User(Base, ModelMixin, TenantMixin):
     email: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
     full_name: Mapped[str] = mapped_column(String(255), nullable=True)
     phone: Mapped[str] = mapped_column(String(40), nullable=True)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    archive_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    archive_hold_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     invitation_id: Mapped[uuid.UUID] = mapped_column(nullable=True)
     relationship_type: Mapped[str] = mapped_column(String(20), nullable=True)

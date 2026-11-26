@@ -62,7 +62,7 @@ class ResendClient:
                 return False
 
     async def send_staff_welcome_email(self, email: str, password: str, full_name: str = "", app_id: str = "",
-                                       idempotency_key: str | None = None) -> bool:
+                                       idempotency_key: str | None = None, *, password_reset: bool = False) -> bool:
         """Security personnel account created by the estate caretaker, with a temporary password."""
         if not self.api_key:
             logger.error("Security staff welcome email not sent: Resend credentials are missing")
@@ -72,15 +72,15 @@ class ResendClient:
         email_data = {
             "from": self.sender,
             "to": [recipient],
-            "subject": "Your Resident Pass gate officer account",
+            "subject": "Your temporary Residence password" if password_reset else "Your Resident Pass gate officer account",
             "html": f"""
                 <h2>Welcome to Resident Pass</h2>
-                <p>Hello {full_name}, your estate caretaker has registered you as security personnel.</p>
+                <p>Hello {full_name}, your estate caretaker {"reset your password" if password_reset else "has registered you as security personnel"}.</p>
                 <p><b>Estate App ID:</b> {app_id}</p>
                 <p><b>Login Email:</b> {email}</p>
                 <p><b>Temporary Password:</b> {password}</p>
                 <p>Sign in to the Residence app with this temporary password. You must choose a new password
-                before you can verify visitors at the gate.</p>
+                before you can {"access your account" if password_reset else "verify visitors at the gate"}.</p>
             """,
         }
         async with httpx.AsyncClient() as client:

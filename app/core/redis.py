@@ -436,77 +436,6 @@ async def blacklist_token(token: str, ttl_seconds: int = 3600) -> bool:
         logger.debug(f"Redis blacklist_token error: {e}")
         return False
 
-# --- Verification Rate-Limiting (Anti-Brute-Force for 4-Digit Codes) ---
-
-def _verify_fail_key(app_id: str, client_ip: str) -> str:
-    return f"residence:ratelimit:fail:{app_id}:{client_ip}"
-
-def _verify_block_key(app_id: str, client_ip: str) -> str:
-    return f"residence:ratelimit:blocked:{app_id}:{client_ip}"
-
-async def check_verification_blocked(app_id: str, client_ip: str) -> Tuple[bool, int]:
-    """
-    Checks if a client/gate is temporarily blocked from verification due to excessive failures.
-    Returns (is_blocked, remaining_seconds).
-    """
-    client = get_redis_client()
-    if not client:
-        return False, 0
-    try:
-        block_key = _verify_block_key(app_id, client_ip)
-        ttl = await client.ttl(block_key)
-        if ttl > 0:
-            return True, ttl
-        return False, 0
-    except Exception as e:
-        logger.debug(f"Redis check_verification_blocked error: {e}")
-        return False, 0
-
-async def record_verification_failure(
-    app_id: str, 
-    client_ip: str, 
-    max_failures: int = 5, 
-    window_seconds: int = 60, 
-    block_seconds: int = 60
-) -> Tuple[int, bool, int]:
-    """
-    Records a failed verification attempt.
-    If failures reach max_failures (e.g., 5), a block key is set for block_seconds.
-    Returns (current_failures, is_blocked, remaining_seconds).
-    """
-    client = get_redis_client()
-    if not client:
-        return 1, False, 0
-    try:
-        fail_key = _verify_fail_key(app_id, client_ip)
-        block_key = _verify_block_key(app_id, client_ip)
-
-        failures = await client.incr(fail_key)
-        if failures == 1:
-            await client.expire(fail_key, window_seconds)
-
-        if failures >= max_failures:
-            await client.set(block_key, "1", ex=block_seconds)
-            await client.delete(fail_key)
-            return failures, True, block_seconds
-
-        return failures, False, 0
-    except Exception as e:
-        logger.debug(f"Redis record_verification_failure error: {e}")
-        return 1, False, 0
-
-async def reset_verification_failures(app_id: str, client_ip: str) -> bool:
-    """Resets the failure counter on a successful verification."""
-    client = get_redis_client()
-    if not client:
-        return False
-    try:
-        await client.delete(_verify_fail_key(app_id, client_ip))
-        return True
-    except Exception as e:
-        logger.debug(f"Redis reset_verification_failures error: {e}")
-        return False
-
 # --- RFID User Lookup Cache ---
 
 def _rfid_cache_key(app_id: str, rfid_tag: str) -> str:
@@ -659,6 +588,27 @@ async def is_token_code_claimed(app_id: str, code: str) -> bool:
         return bool(await client.exists(_token_claimed_key(app_id, code)))
     except Exception:
         return False
+
+async def get_verification_code_cache_state(app_id: str, code: str) -> Optional[str]:
+    """Read current code keys without consuming them. None means Redis could not be checked."""
+    client = get_redis_client()
+    if not client:
+        return None
+    try:
+        visitor, bookout, claimed = await client.mget([
+            _visitor_token_key(app_id, code),
+            _bookout_token_key(app_id, code),
+            _token_claimed_key(app_id, code),
+        ])
+    except Exception:
+        logger.debug("Unable to check verification code cache state", exc_info=True)
+        return None
+    if claimed is not None:
+        return "claimed"
+    if visitor is not None or bookout is not None:
+        return "present"
+    return "absent"
+
 
 async def set_token_live_status(token_id: str, status: str, extra: Optional[Dict[str, Any]] = None, ttl_seconds: int = 86400) -> bool:
     """Immediate status visible to book-out / roster before Postgres drain completes."""

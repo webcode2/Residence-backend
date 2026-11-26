@@ -2,6 +2,7 @@
 from datetime import timedelta
 from fastapi import APIRouter, Depends
 from sqlalchemy import select, func
+from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.dependencies import check_roles
@@ -10,6 +11,8 @@ from app.models.user import User, UserRole
 from app.models.chat import ChatThread, GateSite
 from app.models.access_log import AccessLog
 from app.models.token import VisitorToken
+from app.models.onboarding import AccountPasswordResetJob
+from app.services.account_password_resets import PENDING_STATUSES
 from app.services.chat import list_audit_threads, thread_to_schema
 
 router = APIRouter()
@@ -24,11 +27,22 @@ async def estate_overview(
     aid = user.app_id
     def count(model, *conditions):
         return select(func.count()).select_from(model).where(model.app_id == aid, *conditions).scalar_subquery()
+    retained = aliased(User)
+    returning = select(retained.id).where(
+        retained.app_id == User.app_id,
+        retained.archived_at.is_not(None),
+        retained.archive_hold_at.is_not(None),
+        func.lower(retained.archive_email) == func.lower(User.email),
+    ).exists()
     summary = (await db.execute(select(
         count(User, User.is_revoked.is_(False), User.roles.contains([UserRole.RESIDENT])).label('residents'),
         count(GateSite, GateSite.is_active.is_(True)).label('active_gates'),
         count(ChatThread, ChatThread.status == 'open').label('open_conversations'),
         count(ChatThread, ChatThread.has_active_emergency.is_(True), ChatThread.status == 'open').label('emergencies'),
+        count(AccountPasswordResetJob, AccountPasswordResetJob.status.in_(PENDING_STATUSES)).label('pending_password_resets'),
+        count(User, User.archived_at.is_(None), returning).label('returning_users'),
+        count(User, User.archived_at.is_not(None)).label('archived_accounts'),
+        count(User, User.archived_at.is_not(None), User.archive_hold_at.is_not(None)).label('retained_accounts'),
     ))).mappings().one()
     today = utc_now().date()
     start = today - timedelta(days=6)

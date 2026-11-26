@@ -73,7 +73,7 @@ FCM pushes, exports, purges, gate access logs, visitor-token state, chat persist
 - **Never** do slow work inline in a request, and **never** use `asyncio.create_task` /
   `BackgroundTasks` for external calls: with request-only CPU they stall after the
   response. The owner explicitly rejected processing jobs inline ("SERVERLESS_MODE").
-- Durable jobs (SOS deliveries, welcome emails, history jobs) live in Postgres tables
+- Durable jobs (SOS deliveries, welcome emails, password resets, history jobs) live in Postgres tables
   with leases and `SKIP LOCKED`; Redis lists carry access logs, token state, chat and
   notifications. Queue drains must skip or repair rows referencing deleted users so
   one bad item cannot block a queue.
@@ -108,31 +108,49 @@ Build the profile entry only with `user_cache_payload()` in `app/core/redis.py`;
   page (`POST /api/v1/security-staff`). They get a temporary password (shown once,
   emailed via the worker) and are blocked from every endpoint until they set their own.
   Suspend/reinstate via `PATCH /users/{id}/status`; reset requires a confirmation dialog.
+- Estate directory caretakers can request a generated password reset on another
+  estate account. Postgres stores a job ID and encrypted temporary password. The
+  worker retries delivery and activates the temporary password only after provider
+  acceptance. Sign-in then requires a password change. The directory only displays
+  the job reference and delivery status.
+- Moving a resident directory account into Archive suspends access and removes it
+  from the active directory. A caretaker can reinstate the original account within
+  30 days. A retention hold keeps the record archived and releases its email for
+  a separate registration. Same-estate email matches appear as returning users
+  in the directory. Reinstatement does not merge two accounts.
+- The worker purges unheld archived accounts and their linked records after 30
+  days. It checks for retention holds under the account lock. Sign-in surfaces
+  can request reinstatement by estate App ID and email. The request queues an
+  email and records a notice for active estate caretakers. It does not grant access.
 - User-facing wording is **"Host / Property Owner"**; the stored role value, API paths
   (`/api/v1/landlords`) and DB tables keep `landlord` — do not rename those.
 
 ## 6. Mobile app structure (one install, two separate apps)
 
-The owner wants the resident app and the gate (security) app **fully separate inside
-one install**, so the gate app can be redesigned without affecting residents.
+The resident and gate (security) experiences stay separate inside one install. The
+owner approved a shared chat implementation so fixes to the inbox and thread apply
+to both roles while each app keeps its own navigation and presentation.
 
 ```
 lib/
   main.dart          bootstrap; after sign-in picks ResidentApp or GateApp by role
-  shared/            sign-in and app-wide pieces only
-    auth/ config/ models/user_model.dart notifications/ sos/ account/ chat/chat_service.dart ui/
-  resident/          resident app: screens, state (visitor_store), data, models, widgets
-  gate/              gate app: screens, state (gatehouse_store, gate_visitor_store),
-                     data, models, its own chat screen (gate_chat_thread_screen)
+  shared/            sign-in, app-wide pieces, and common chat
+    auth/ config/ models/user_model.dart notifications/ sos/ account/ chat/ ui/
+  resident/          resident chat entry point, screens, state (visitor_store), data, models, widgets
+  gate/              guard chat entry point, screens, state (gatehouse_store, gate_visitor_store),
+                     data, models
 ```
 
 - `gate/` must never import `resident/`; `resident/` never imports `gate/`; `shared/`
   imports neither. Enforced by `mobile/test/module_boundaries_test.dart`.
-- Put shared code in `shared/` only when both apps genuinely need it (sign-in, top bar,
-  theme, push, SOS). Otherwise copy it into the module that needs it. The gate copies
-  (`GateVisitorStore`, `GateChatThreadScreen`, gate `visitor_pass`/`visitor_api`) exist
-  for this reason — do not merge them back into shared code.
-- **Gate redesign work happens only in `lib/gate/`.**
+- Common inbox and conversation UI, message and composer rendering, refresh and
+  server requests live in `lib/shared/chat/`. Resident and gate chat entry points
+  provide the participant labels, role, navigation, and any role-specific inbox
+  presentation. Preserve the server's authorization checks.
+- Keep other code module-local unless both apps genuinely need it. Keep
+  `GateVisitorStore` and the gate `visitor_pass` and `visitor_api` in `lib/gate/`.
+- **Gate-specific redesign work happens in `lib/gate/`.** Changes to common chat
+  belong in `lib/shared/chat/` when they apply to both roles.
 
 ## 7. How to test and deploy
 

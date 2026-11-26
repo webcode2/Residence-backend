@@ -60,7 +60,7 @@ async def _repeat(step, limit: int) -> int:
 
 async def _one_pass(totals: Counter) -> int:
     """Process everything currently due once. Returns how many items were handled."""
-    from app.services import history_jobs, landlords, sos
+    from app.services import account_archive, account_password_resets, history_jobs, landlords, sos
     from app.services.access_logs import drain_access_log_queue
     from app.services.chat import drain_chat_message_queue
     from app.services.notification_queue import drain_notification_queue
@@ -88,7 +88,9 @@ async def _one_pass(totals: Counter) -> int:
     await run("access_logs", lambda: with_session(drain_access_log_queue))
     await run("token_states", lambda: with_session(drain_token_state_queue))
     await run("chat_messages", lambda: with_session(drain_chat_message_queue))
+    await run("password_resets", lambda: _repeat(account_password_resets.process_one, MAX_JOBS_PER_PASS))
     await run("welcome_emails", lambda: _repeat(landlords.process_one, MAX_JOBS_PER_PASS))
+    await run("archived_accounts", lambda: _repeat(account_archive.purge_one, MAX_JOBS_PER_PASS))
     await run("history_jobs", lambda: _repeat(history_jobs.process_one, MAX_JOBS_PER_PASS))
     return handled
 
@@ -96,14 +98,23 @@ async def _one_pass(totals: Counter) -> int:
 async def _next_due() -> Optional[object]:
     """Earliest future retry across the durable job tables (within 24 hours)."""
     from app.models.history import HistoryJob
-    from app.models.onboarding import LandlordOnboardingJob as Job
+    from app.models.onboarding import AccountPasswordResetJob, LandlordOnboardingJob as Job
     from app.models.sos import SOSDelivery
+    from app.models.user import User
+    from app.services.account_archive import ARCHIVE_RETENTION
     now, horizon = utc_now(), utc_now() + timedelta(hours=24)
     async with SessionLocal() as db:
+        archived_at = await db.scalar(select(func.min(User.archived_at)).where(
+            User.archived_at.is_not(None), User.archive_hold_at.is_(None),
+            User.is_revoked.is_(True),
+        ))
         candidates = [
             await db.scalar(select(func.min(SOSDelivery.next_attempt_at)).where(
                 SOSDelivery.status.in_(["pending", "failed", "awaiting_receipt", "report_pending"]),
                 SOSDelivery.attempts < 6, SOSDelivery.next_attempt_at > now)),
+            await db.scalar(select(func.min(AccountPasswordResetJob.next_attempt_at)).where(
+                AccountPasswordResetJob.status.in_(["queued", "retrying"]),
+                AccountPasswordResetJob.next_attempt_at > now)),
             await db.scalar(select(func.min(Job.next_attempt_at)).where(
                 Job.status.in_(["queued", "retrying"]), Job.next_attempt_at > now)),
             await db.scalar(select(func.min(Job.lease_until)).where(
@@ -112,6 +123,9 @@ async def _next_due() -> Optional[object]:
                 HistoryJob.status.in_(["queued", "processing", "previewing"]), HistoryJob.next_attempt_at > now)),
         ]
     due = [c for c in candidates if c is not None and c <= horizon]
+    if archived_at is not None:
+        purge_due = archived_at + ARCHIVE_RETENTION
+        due.append(min(max(purge_due, now + timedelta(seconds=30)), now + timedelta(days=29)))
     return min(due) if due else None
 
 

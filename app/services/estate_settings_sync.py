@@ -8,10 +8,17 @@ from app.models.sos import PushDevice
 from app.services.fcm import fcm_service
 
 async def snapshot(db, app_id):
-    length = await db.scalar(select(Estate.token_code_length).where(Estate.app_id == app_id))
-    if length is None:
+    result = await db.execute(
+        select(Estate.name, Estate.token_code_length).where(Estate.app_id == app_id)
+    )
+    estate = result.one_or_none()
+    if estate is None:
         raise HTTPException(404, 'Estate not found')
-    return {'app_id': app_id, 'token_code_length': length}
+    return {
+        'app_id': app_id,
+        'estate_name': estate.name,
+        'token_code_length': estate.token_code_length,
+    }
 
 async def recipients(db, app_id):
     devices = (await db.execute(select(PushDevice.token).join(User, User.id == PushDevice.user_id).where(User.app_id == app_id, User.is_revoked.is_(False)))).scalars().all()

@@ -188,6 +188,13 @@ async def process_one(db):
             await invalidate_cached_user(job.app_id, job.email)
             job = (await db.execute(select(Job).where(Job.id == job_id).with_for_update())).scalar_one()
         account = await db.get(User, job.user_id)
+        if not account or account.archived_at is not None or account.email != job.email:
+            job.status = 'skipped'
+            job.password_ciphertext = None
+            job.lease_until = None
+            job.last_error = 'Account is no longer eligible for this welcome email'
+            await db.commit()
+            return True
         if account and not account.must_change_password:
             job.status = 'sent'
             job.password_ciphertext = None

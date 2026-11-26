@@ -32,3 +32,14 @@ class LandlordImportFile(Base, ModelMixin, TenantMixin):
     batch_id: Mapped[uuid.UUID] = mapped_column(index=True)
     uploaded_by: Mapped[uuid.UUID] = mapped_column(ForeignKey('users.id'), nullable=True)
     deleted_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+
+class AccountPasswordResetJob(Base, ModelMixin, TenantMixin):
+    __tablename__ = "account_password_reset_jobs"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    email: Mapped[str] = mapped_column(String(255))
+    previous_password_fingerprint: Mapped[str] = mapped_column(String(64))
+    password_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    attempts: Mapped[int] = mapped_column(default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, index=True, nullable=True)
