@@ -1,3 +1,4 @@
+from pydantic import BaseModel, EmailStr
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
@@ -63,9 +64,13 @@ async def login_for_access_token(
 
     
     if user.is_revoked:
+        # Only reached with the correct password, so this reveals nothing to guessers.
+        # The header tells the app to offer "Request account reinstatement".
+        from app.services.account_archive import reinstatement_eligible
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User account is revoked",
+            headers={"X-Account-Status": "suspended"} if reinstatement_eligible(user) else None,
         )
 
     access_token = auth_service.create_access_token(
@@ -93,6 +98,27 @@ async def login_for_access_token(
         "user": user,
         "token_code_length": token_code_length,
     }
+
+class ReinstatementRequest(BaseModel):
+    email: EmailStr
+
+
+@router.post("/request-reinstatement", status_code=202)
+async def request_reinstatement(
+    body: ReinstatementRequest,
+    request: Request,
+    app_id: str = Depends(ValidateTenant(is_auth_route=True)),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.core.redis import check_rate_limit
+    from app.services.account_archive import request_reinstatement
+
+    client_ip = request.client.host if request.client else "unknown"
+    allowed, _, _ = await check_rate_limit("archive_request", f"{app_id}:{client_ip}", 10, 3600)
+    if allowed:
+        await request_reinstatement(db, app_id, str(body.email))
+    return {"message": "If the account is eligible, your estate management team will receive your request."}
+
 
 @router.post("/logout", tags=["auth"])
 async def logout(
