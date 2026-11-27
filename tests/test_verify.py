@@ -202,3 +202,38 @@ async def test_unrelated_misses_do_not_block_entry_or_exit(client, db_session, g
     checked_out = await client.get("/api/v1/verify/book-out/0C1234", headers=other_guard)
     assert checked_out.status_code == 200
     assert checked_out.json()["action"] == "book_out"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('action', 'title', 'verb'), [
+    ('check_in', 'Visitor arrival', 'checked in'),
+    ('book_out', 'Visitor departure', 'checked out'),
+])
+async def test_visitor_access_names_guest_in_inbox_and_push(db_session, monkeypatch, action, title, verb):
+    from unittest.mock import AsyncMock
+    from sqlalchemy import select
+    from app.api.v1.endpoints.verify import _notify_visitor_access
+    from app.models.sos import AppNotification
+    from app.services import notification_queue
+
+    app_id = 'RP-VISITOR'
+    resident = User(email='resident@visitor.example', app_id=app_id,
+                    roles=[UserRole.RESIDENT], hashed_password='unused', fcm_token='test-device')
+    db_session.add(resident)
+    await db_session.commit()
+    dispatch = AsyncMock()
+    monkeypatch.setattr(notification_queue, 'dispatch', dispatch)
+
+    await _notify_visitor_access(db_session, app_id, {
+        'action': action, 'resident_id': resident.id, 'visitor_name': 'Ada Okafor',
+        'message': 'Generic verification result',
+    })
+
+    row = await db_session.scalar(select(AppNotification).where(AppNotification.user_id == resident.id))
+    assert row.title == title
+    assert row.body == f'Ada Okafor {verb} at the gate.'
+    dispatch.assert_awaited_once_with(
+        'push', token='test-device', title=title, body=row.body,
+        data={**row.data, 'notification_count': 1},
+    )
+    assert row.data['notification_event_key'] == row.event_key

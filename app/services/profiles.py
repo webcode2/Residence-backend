@@ -9,11 +9,15 @@ from app.core.redis import invalidate_cached_user, invalidate_cached_rfid_user, 
 from app.models.user import User, UserRole
 from app.models.token import RegistrationToken
 from app.models.estate import Estate
-from app.services.auth import verify_password_async, create_access_token
+from app.services.auth import verify_password_async, create_access_token, session_id
 
 
 async def update_profile(db, current_user, profile, token):
-    user = await db.get(User, current_user.id, populate_existing=True)
+    claims = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    active_session = session_id(claims, token)
+    user = await db.get(User, current_user.id, with_for_update=True, populate_existing=True)
+    if user and user.active_session_id != active_session:
+        raise HTTPException(401, 'This session has ended. Sign in again.')
     if not user or user.is_revoked:
         raise HTTPException(401, 'Your account is unavailable')
     changes = profile.model_dump(exclude_unset=True, exclude={'current_password'})
@@ -50,9 +54,8 @@ async def update_profile(db, current_user, profile, token):
     for email,rfid in household:
         await invalidate_cached_user(user.app_id,email)
         await invalidate_cached_rfid_user(user.app_id,rfid)
-    claims = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
     remaining = max(1, claims['exp'] - datetime.now(UTC).timestamp())
     await blacklist_token(token, ttl_seconds=int(remaining) + 1)
-    fresh = create_access_token({'sub': user.email, 'uid': str(user.id), 'app_id': user.app_id, 'roles': [r.value for r in user.roles], 'purpose': 'access', 'jti': str(uuid.uuid4())}, expires_delta=timedelta(seconds=remaining))
+    fresh = create_access_token({'sub': user.email, 'uid': str(user.id), 'app_id': user.app_id, 'roles': [r.value for r in user.roles], 'purpose': 'access', 'sid': active_session, 'jti': str(uuid.uuid4())}, expires_delta=timedelta(seconds=remaining))
     length = await db.scalar(select(Estate.token_code_length).where(Estate.app_id == user.app_id))
     return {'token': {'access_token': fresh, 'token_type': 'bearer'}, 'user': user, 'token_code_length': length or 6}

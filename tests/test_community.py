@@ -16,12 +16,14 @@ REPORT = {'title': 'Broken gate light', 'description': 'The north gate light has
 async def estate(db_session):
     people = {}
     for key, roles, tenant in [('caretaker', [UserRole.CARETAKER], 'COMM-ONE'), ('resident', [UserRole.RESIDENT], 'COMM-ONE'),
-                               ('neighbour', [UserRole.RESIDENT], 'COMM-ONE'), ('guard', [UserRole.SECURITY], 'COMM-ONE'),
+                               ('neighbour', [UserRole.RESIDENT], 'COMM-ONE'), ('host', [UserRole.LANDLORD], 'COMM-ONE'), ('independent', [UserRole.RESIDENT], 'COMM-ONE'), ('guard', [UserRole.SECURITY], 'COMM-ONE'),
                                ('outsider', [UserRole.CARETAKER], 'COMM-TWO')]:
         people[key] = User(email=f'{key}@community.example', full_name=key.title(), hashed_password='not-used',
                            roles=roles, app_id=tenant)
         db_session.add(people[key])
     await db_session.commit()
+    for name in ('resident', 'neighbour'):
+        people[name].landlord_id = people['host'].id
     db_session.add(PushDevice(token='resident-phone', user_id=people['resident'].id))
     await db_session.commit()
     return people
@@ -53,14 +55,18 @@ async def test_resident_report_reaches_caretaker_inbox(client, db_session, estat
 
 
 @pytest.mark.asyncio
-async def test_anonymous_report_hides_reporter_from_caretaker(client, estate, act_as):
+async def test_anonymous_report_shows_identity_only_to_authorized_caretaker(client, estate, act_as):
     await file_report(client, act_as, estate['resident'], is_anonymous=True)
     act_as(estate['caretaker'])
     listed = (await client.get('/api/v1/reports')).json()
     assert listed['reports'][0]['reported_by_name'] == 'Anonymous' and listed['counts']['open'] == 1
+    assert listed['reports'][0]['reporter_identity'] == 'Resident'
+    assert listed['reports'][0]['reporter_id'] == str(estate['resident'].id)
     act_as(estate['resident'])
     own = (await client.get('/api/v1/reports')).json()
     assert own['reports'][0]['reported_by_name'] == 'You (anonymous)' and own['reports'][0]['is_own']
+    assert 'reporter_identity' not in own['reports'][0]
+    assert 'reporter_id' not in own['reports'][0]
 
 
 @pytest.mark.asyncio
@@ -107,11 +113,45 @@ async def test_announcement_targets_audience_inbox_and_push(client, db_session, 
     item = response.json()
     assert item['recipient_count'] == 2 and item['push_sent'] == 1 and item['push_failed'] == 0
     assert push.call_args.args[0] == ['resident-phone']
+    assert push.call_args.kwargs['high_priority'] is False
+    assert push.call_args.args[3]['app_id'] == 'COMM-ONE'
     recipients = set((await db_session.execute(select(AppNotification.user_id).where(
         AppNotification.event_key == f"announcement:{item['id']}"))).scalars().all())
     assert recipients == {estate['resident'].id, estate['neighbour'].id}
     history = (await client.get('/api/v1/announcements')).json()
     assert [a['id'] for a in history['announcements']] == [item['id']]
+
+
+@pytest.mark.parametrize(('category', 'audience', 'expected'), [
+    ('alert', 'all', {'resident', 'neighbour', 'host', 'guard', 'independent'}),
+    ('security', 'security', {'guard'}),
+    ('maintenance', 'landlord', {'host'}),
+])
+@pytest.mark.asyncio
+async def test_announcement_deep_link_is_recipient_scoped(
+    client, estate, act_as, monkeypatch, category, audience, expected,
+):
+    push = AsyncMock(return_value=[])
+    monkeypatch.setattr(community.fcm_service, 'send_to_tokens', push)
+    act_as(estate['caretaker'])
+    response = await client.post('/api/v1/announcements', json={
+        'title': 'Estate notice', 'body': 'Check the estate notice.',
+        'category': category, 'audience': audience,
+    })
+    assert response.status_code == 201, response.text
+    announcement = response.json()
+    assert announcement['recipient_count'] == len(expected)
+    assert push.call_args.kwargs['high_priority'] == (category in {'alert', 'security'})
+    payload = community.fcm_service._build_message('device', 'Title', 'Body', push.call_args.args[3],
+                                                  push.call_args.kwargs['high_priority'])['message']
+    assert payload['android']['priority'] == ('NORMAL' if category == 'maintenance' else 'HIGH')
+    assert payload['apns']['headers']['apns-priority'] == ('5' if category == 'maintenance' else '10')
+    for role, user in estate.items():
+        act_as(user)
+        detail = await client.get(f"/api/v1/notifications/announcements/{announcement['id']}")
+        assert detail.status_code == (200 if role in expected else 404)
+        if role in expected:
+            assert detail.json()['data']['category'] == category
 
 
 @pytest.mark.asyncio

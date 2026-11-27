@@ -1,5 +1,5 @@
 from app.services.account_archive import ARCHIVE_RETENTION
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Header
+from fastapi import APIRouter, Body, Depends, HTTPException, status, Query, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 from app.core.database import get_db
@@ -8,7 +8,11 @@ from app.schemas.estate import EstateRegistrationRequestSchema, EstateRegistrati
 from app.services import users as user_service, estates as estate_service
 from app.dependencies import validate_tenant, check_roles, get_current_user, check_user_access, oauth2_scheme
 from app.models.user import User, UserRole
+from app.models.admin_audit import AdminAuditLog
 import uuid
+from jose import jwt
+from app.core.config import settings
+from app.services.auth import session_id
 
 router = APIRouter()
 
@@ -16,15 +20,19 @@ router = APIRouter()
 async def update_my_fcm_token(
     fcm_in: FCMTokenUpdateSchema,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    token: str = Depends(oauth2_scheme),
 ):
     """
     Update or register the FCM device push notification token for the logged-in user.
     Called automatically on app launch, login, or when FCM rotates the device token.
     """
-    success = await user_service.update_user_fcm_token(db, current_user.id, fcm_in.fcm_token)
+    claims = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    success = await user_service.update_user_fcm_token(
+        db, current_user.id, fcm_in.fcm_token, active_session=session_id(claims, token))
     if not success:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(401, "This session has ended. Sign in again.",
+                            headers={"X-Session-Status": "replaced"})
     return {"status": "success", "message": "FCM token synced successfully"}
 
 @router.get("/me/profile", response_model=UserSchema, tags=["profiling"])
@@ -166,9 +174,26 @@ async def list_archived_accounts(
             for row in rows]
 
 
+def require_suspension_reason(body: dict) -> str:
+    value = body.get("reason")
+    reason = value.strip() if isinstance(value, str) else ""
+    if not reason or len(reason) > 500:
+        raise HTTPException(422, detail="Enter a suspension reason of 1 to 500 characters.")
+    return reason
+
+
+def record_suspension(db: AsyncSession, actor: User, target: User, reason: str, action: str) -> None:
+    db.add(AdminAuditLog(
+        actor_id=actor.id, actor_email=actor.email, action=action,
+        target_type="user", target_id=str(target.id),
+        changes={"app_id": target.app_id, "reason": {"before": None, "after": reason}},
+    ))
+
+
 @router.patch("/{user_id}/archive", tags=["users"])
 async def archive_account(
     user_id: uuid.UUID,
+    body: dict = Body(default_factory=dict),
     app_id: str = Depends(validate_tenant),
     db: AsyncSession = Depends(get_db),
     current_user = Depends(check_roles([UserRole.CARETAKER])),
@@ -186,6 +211,8 @@ async def archive_account(
     if user.id == current_user.id or UserRole.SAAS_OWNER in user.roles:
         raise HTTPException(403, detail="This account cannot be archived from the directory")
     if user.archived_at is None:
+        reason = require_suspension_reason(body)
+        record_suspension(db, current_user, user, reason, "user.archive")
         user.archived_at = utc_now()
         user.is_revoked = True
         user.fcm_token = None
@@ -397,7 +424,11 @@ async def set_user_status(
     """Suspend or restore a user account within the estate."""
     if "is_revoked" not in body or not isinstance(body["is_revoked"], bool):
         raise HTTPException(status_code=422, detail="is_revoked boolean is required")
-    target = await user_service.get_user(db, user_id, app_id)
+    from sqlalchemy import select
+
+    target = (await db.execute(select(User).where(
+        User.id == user_id, User.app_id == app_id,
+    ).with_for_update())).scalar_one_or_none()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     if UserRole.SAAS_OWNER in target.roles:
@@ -406,27 +437,41 @@ async def set_user_status(
         raise HTTPException(status_code=409, detail="You cannot change your own account status")
     if target.archived_at is not None:
         raise HTTPException(409, detail="Archived accounts cannot be changed here")
-    target.is_revoked = body["is_revoked"]
     if body["is_revoked"]:
+        reason = require_suspension_reason(body)
+        if not target.is_revoked:
+            record_suspension(db, current_user, target, reason, "user.suspend")
         target.fcm_token = None
+    target.is_revoked = body["is_revoked"]
     await db.commit()
     await db.refresh(target)
     from app.core.redis import invalidate_cached_user, invalidate_cached_rfid_user
     await invalidate_cached_user(app_id, target.email)
     await invalidate_cached_rfid_user(app_id, target.rfid_tag)
     if UserRole.LANDLORD in target.roles:
-        from sqlalchemy import select
         residents = (await db.execute(select(User).where(User.landlord_id == target.id, User.app_id == app_id))).scalars().all()
         for resident in residents:
             await invalidate_cached_rfid_user(app_id, resident.rfid_tag)
             await invalidate_cached_user(app_id, resident.email)
     return target
 @router.delete("/me/fcm-token", tags=["users"])
-async def unregister_my_device(fcm_in: FCMTokenUpdateSchema, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    from sqlalchemy import delete, select
+async def unregister_my_device(
+    fcm_in: FCMTokenUpdateSchema,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    token: str = Depends(oauth2_scheme),
+):
+    from sqlalchemy import delete
     from app.models.sos import PushDevice
-    await db.execute(delete(PushDevice).where(PushDevice.token==fcm_in.fcm_token,PushDevice.user_id==current_user.id))
-    user = await db.get(User,current_user.id)
-    if user and user.fcm_token==fcm_in.fcm_token: user.fcm_token=None
+
+    claims = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    user = await db.get(User, current_user.id, with_for_update=True, populate_existing=True)
+    if not user or user.active_session_id != session_id(claims, token):
+        raise HTTPException(401, "This session has ended. Sign in again.",
+                            headers={"X-Session-Status": "replaced"})
+    await db.execute(delete(PushDevice).where(
+        PushDevice.token == fcm_in.fcm_token, PushDevice.user_id == user.id))
+    if user.fcm_token == fcm_in.fcm_token:
+        user.fcm_token = None
     await db.commit()
     return {"status":"success"}

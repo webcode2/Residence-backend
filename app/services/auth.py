@@ -5,7 +5,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from app.core.config import settings
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
 from app.models.user import User
 import uuid
 
@@ -57,6 +57,36 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     return encoded_jwt
+
+def session_id(payload: dict, token: str) -> str:
+    return payload.get("sid") or hashlib.sha256(token.encode()).hexdigest()
+
+
+async def clear_session_devices(db: AsyncSession, user: User) -> None:
+    from app.models.sos import PushDevice
+
+    await db.execute(delete(PushDevice).where(PushDevice.user_id == user.id))
+    user.fcm_token = None
+
+
+async def validate_session(db: AsyncSession, user: User, payload: dict, token: str) -> bool:
+    requested = session_id(payload, token)
+    if user.active_session_id is not None:
+        return user.active_session_id == requested
+    if payload.get("sid"):
+        return False
+
+    # During rollout, the first valid legacy session to return claims the account.
+    result = await db.execute(
+        update(User).where(User.id == user.id, User.active_session_id.is_(None))
+        .values(active_session_id=requested, fcm_token=None).returning(User.id)
+    )
+    if result.scalar_one_or_none() is not None:
+        await clear_session_devices(db, user)
+        await db.commit()
+        return True
+    return await db.scalar(select(User.active_session_id).where(User.id == user.id)) == requested
+
 
 # --- SaaS Platform Admin Isolated Auth ---
 

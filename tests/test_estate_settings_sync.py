@@ -15,12 +15,12 @@ async def test_snapshot_and_admin_invalidation_are_estate_scoped(client, db_sess
     db_session.add_all([Estate(app_id=app_id,name='Sync',is_active=True,token_code_length=6),Estate(app_id=other,name='Other',is_active=True)])
     users=[]
     for role,estate in [(UserRole.CARETAKER,app_id),(UserRole.RESIDENT,app_id),(UserRole.SECURITY,app_id),(UserRole.RESIDENT,other)]:
-        user=User(email=uuid.uuid4().hex+'@example.com',app_id=estate,roles=[role],hashed_password='unused')
+        user=User(email=uuid.uuid4().hex+'@example.com',app_id=estate,roles=[role],hashed_password='unused',active_session_id=uuid.uuid4().hex)
         db_session.add(user);users.append(user)
     await db_session.flush()
     for n,user in enumerate(users): db_session.add(PushDevice(token=f'sync-device-{n}',user_id=user.id))
     await db_session.commit()
-    def headers(user):return {'X-App-Id':user.app_id,'Authorization':'Bearer '+create_access_token({'sub':user.email,'uid':str(user.id),'app_id':user.app_id})}
+    def headers(user):return {'X-App-Id':user.app_id,'Authorization':'Bearer '+create_access_token({'sub':user.email,'uid':str(user.id),'sid':user.active_session_id,'app_id':user.app_id})}
     notify=AsyncMock()
     monkeypatch.setattr(notification_queue, 'dispatch', notify)
     for user in users[:3]:

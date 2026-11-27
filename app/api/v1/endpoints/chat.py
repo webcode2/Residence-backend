@@ -38,6 +38,7 @@ from app.schemas.chat import (
     ThreadStatus,
 )
 from app.services import chat as chat_service
+from app.services.auth import token_matches_user, validate_session
 from app.services.chat_websocket import ChatConnection, chat_hub
 
 logger = logging.getLogger(__name__)
@@ -250,9 +251,10 @@ async def _authenticate_ws(websocket: WebSocket, token: str) -> Optional[User]:
                 User.email == email, User.app_id == app_id, Estate.is_active.is_(True)
             )
         )).scalar_one_or_none()
-    if not user or user.is_revoked or user.must_change_password or payload.get("purpose") == "password_change":
-        return None
-    return user
+        if (not user or user.is_revoked or user.must_change_password
+                or payload.get("purpose") == "password_change" or not token_matches_user(payload, user)):
+            return None
+        return user if await validate_session(db, user, payload, token) else None
 
 
 async def _ws_send_message(websocket: WebSocket, user: User, data: dict) -> dict:
@@ -287,12 +289,16 @@ async def chat_websocket(websocket: WebSocket, token: str = Query(...)):
         await websocket.close(code=WS_CLOSE_UNAUTHORIZED)
         return
 
+    async def still_authorized() -> bool:
+        return await _authenticate_ws(websocket, token) is not None
+
     await websocket.accept()
     conn = ChatConnection(
         websocket=websocket,
         user_id=str(user.id),
         app_id=user.app_id,
         roles={r.value for r in user.roles},
+        authorize=still_authorized,
     )
     await chat_hub.connect(conn)
     await conn.send_json({"action": "connected", "user_id": str(user.id), "is_guard": chat_service.is_guard(user)})
@@ -308,6 +314,9 @@ async def chat_websocket(websocket: WebSocket, token: str = Query(...)):
                 await conn.send_json({"action": "error", "detail": "Payload must be a JSON object"})
                 continue
 
+            if not await still_authorized():
+                await websocket.close(code=WS_CLOSE_UNAUTHORIZED)
+                break
             action = data.get("action")
             try:
                 if action == "ping":

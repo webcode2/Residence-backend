@@ -68,7 +68,10 @@ class Estate_:
 
     def token(self, key: str) -> str:
         user = self.users[key]
-        return create_access_token({"sub": user.email, "roles": [r.value for r in user.roles], "app_id": self.app_id})
+        return create_access_token({
+            "sub": user.email, "uid": str(user.id), "app_id": self.app_id,
+            "sid": user.active_session_id, "roles": [r.value for r in user.roles],
+        })
 
     def headers(self, key: str) -> Dict[str, str]:
         return {"X-App-Id": self.app_id, "Authorization": f"Bearer {self.token(key)}"}
@@ -101,6 +104,7 @@ async def estate(db_session):
             id=user_id,
             email=f"{key}-{tag}@chat.test", full_name=name, hashed_password="hashed",
             roles=roles, app_id=app_id, house_number=house, street_name=street,
+            active_session_id=uuid.uuid4().hex,
             fcm_token=f"fcm-{key}-{tag}" if fcm else None,
         )
         db_session.add(user)
@@ -469,6 +473,23 @@ async def test_websocket_rejects_bad_token(client):
     assert ws.close_code == WS_CLOSE_UNAUTHORIZED
 
 
+async def test_websocket_closes_when_session_is_replaced(client, db_session, estate):
+    user = estate.users["guard1"]
+    token = estate.token("guard1")
+
+    class ReplacedSessionSocket(FakeWebSocket):
+        async def receive_json(self):
+            user.active_session_id = uuid.uuid4().hex
+            await db_session.commit()
+            return {"action": "ping"}
+
+    socket = ReplacedSessionSocket([])
+    await chat_websocket(socket, token=token)
+    assert socket.accepted
+    assert socket.close_code == WS_CLOSE_UNAUTHORIZED
+    assert not socket.replies("pong")
+
+
 async def test_websocket_join_send_ping_leave(client, estate, push_mock):
     main = await create_gate(client, estate, "Main Gate Alpha", "GATE-A")
     await go_on_duty(client, estate, "guard1", main["id"], "GH-04")
@@ -610,18 +631,17 @@ async def test_removing_participant_preserves_conversation_log(client, estate, d
     assert detail.status_code == 200
     assert detail.json()['messages'][0]['sender_name'] == 'Ada Obi'
 
-async def test_offline_resident_receives_reply_on_every_registered_device(client, estate, db_session, push_mock):
-    from app.models.sos import PushDevice
-    resident = estate.users['resident']
-    db_session.add_all([
-        PushDevice(token='resident-second-device', user_id=resident.id),
-        PushDevice(token=resident.fcm_token, user_id=resident.id),
-        PushDevice(token='other-household-device', user_id=estate.users['resident2'].id),
-    ])
-    await db_session.commit()
+async def test_offline_resident_receives_reply_on_latest_registered_device(client, estate, push_mock):
+    for token in ('resident-original-device', 'resident-replacement-device'):
+        registration = await client.post(
+            '/api/v1/users/me/fcm-token',
+            headers=estate.headers('resident'),
+            json={'fcm_token': token},
+        )
+        assert registration.status_code == 200
     thread = await open_thread(client, estate)
     push_mock.reset_mock()
     response = await client.post(f"/api/v1/chat/threads/{thread['id']}/messages", json={'message': 'Your visitor has arrived'}, headers=estate.headers('guard1'))
     assert response.status_code == 201, response.text
-    assert sorted(pushed_tokens(push_mock)) == sorted([resident.fcm_token, 'resident-second-device'])
+    assert pushed_tokens(push_mock) == ['resident-replacement-device']
     assert all(c.args[3]['thread_id'] == thread['id'] for c in push_mock.await_args_list)

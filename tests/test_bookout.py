@@ -28,6 +28,7 @@ async def test_full_visitor_lifecycle_and_bookout(client, db_session, guard_head
 
     resident = User(
         email="resident_bookout@test.com",
+        full_name="Fixture Host",
         hashed_password="hash",
         roles=[UserRole.RESIDENT],
         app_id=app_id
@@ -51,12 +52,30 @@ async def test_full_visitor_lifecycle_and_bookout(client, db_session, guard_head
     assert resp_premature.status_code == 400
     assert "not checked in" in resp_premature.json()["detail"].lower()
 
-    # 3. Visitor arrives at ENTRY gate (GET /api/v1/verify/token/{code})
+    # 3. Looking up the entry token twice leaves it available for approval.
     gate_headers = await guard_headers(app_id)
-    resp_entry = await client.get(f"/api/v1/verify/token/{entry_code}", headers=gate_headers)
+    from sqlalchemy import select
+    from app.models.access_log import AccessLog
+    from app.core.redis import is_token_code_claimed
+
+    for _ in range(2):
+        preview = await client.get(f"/api/v1/verify/token-preview/{entry_code.lower()}", headers=gate_headers)
+        assert preview.status_code == 200, preview.text
+        assert preview.json() == {
+            "action": "check_in", "visitor_name": "Delivery Person", "host_name": "Fixture Host",
+        }
+    assert (await client.get(f"/api/v1/verify/token-preview/{entry_code}", headers=headers)).status_code == 403
+    before = await db_session.get(VisitorToken, uuid.UUID(token_id))
+    assert before.status == "pending" and not before.is_used
+    assert not await is_token_code_claimed(app_id, entry_code)
+    assert await db_session.scalar(select(AccessLog.id).where(AccessLog.app_id == app_id)) is None
+
+    resp_entry = await client.post(f"/api/v1/verify/token/{entry_code}/approve",
+                                   params={"direction": "entry"}, headers=gate_headers)
     assert resp_entry.status_code == 200
     assert resp_entry.json()["status"] == "authorized"
     assert resp_entry.json()["action"] == "check_in"
+    assert resp_entry.json()["host_name"] == "Fixture Host"
 
     # Flush queued Postgres mark-used write (Redis-unavailable tests write sync)
     from app.services.token_state import drain_token_state_queue
@@ -76,9 +95,33 @@ async def test_full_visitor_lifecycle_and_bookout(client, db_session, guard_head
     assert len(bookout_code) == 6
     assert bookout_data["token_id"] == token_id
 
-    # 5. Visitor arrives at EXIT gate:
-    # Test using the UNIFIED SINGLE ROUTE /verify/token/{code} without guard switching screens!
-    resp_exit_unified = await client.get(f"/api/v1/verify/token/{bookout_code}", headers=gate_headers)
+    repeat = await client.post(f"/api/v1/tokens/visitor/{token_id}/book-out", headers=headers)
+    assert repeat.status_code == 200
+    assert repeat.json()["bookout_code"] == bookout_code
+    assert repeat.json()["expires_at"] == bookout_data["expires_at"]
+
+    expired_code = bookout_code
+    token_db.bookout_expires_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=1)
+    await db_session.commit()
+    assert (await client.get(f"/api/v1/verify/token-preview/{expired_code}",
+                             headers=gate_headers)).status_code == 401
+
+    renewed = await client.post(f"/api/v1/tokens/visitor/{token_id}/book-out", headers=headers)
+    assert renewed.status_code == 200, renewed.text
+    bookout_code = renewed.json()["bookout_code"]
+    assert bookout_code != expired_code
+    assert renewed.json()["expires_at"] > bookout_data["expires_at"]
+    assert (await client.get(f"/api/v1/verify/token/{expired_code}",
+                             params={"direction": "exit"}, headers=gate_headers)).status_code == 401
+
+    # 5. Preview and approve the distinct exit action.
+    preview = await client.get(f"/api/v1/verify/token-preview/{bookout_code}", headers=gate_headers)
+    assert preview.status_code == 200 and preview.json()["action"] == "book_out"
+    assert not await is_token_code_claimed(app_id, bookout_code)
+    assert (await client.post(f"/api/v1/verify/token/{bookout_code}/approve",
+                              params={"direction": "entry"}, headers=gate_headers)).status_code == 409
+    resp_exit_unified = await client.post(f"/api/v1/verify/token/{bookout_code}/approve",
+                                          params={"direction": "exit"}, headers=gate_headers)
     assert resp_exit_unified.status_code == 200
     assert resp_exit_unified.json()["status"] == "authorized"
     assert resp_exit_unified.json()["action"] == "book_out"

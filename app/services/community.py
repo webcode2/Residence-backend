@@ -37,11 +37,17 @@ def iso(value) -> str:
     return value.isoformat() + 'Z'
 
 
-def report_view(report: IncidentReport, viewer: User) -> dict:
-    # Caretakers never see who filed an anonymous report; the name is not even stored.
+def report_view(report: IncidentReport, viewer: User, reporter: User | None = None) -> dict:
     own = report.reporter_id == viewer.id
     name = 'You (anonymous)' if report.is_anonymous and own else 'Anonymous' if report.is_anonymous else report.reporter_name or 'Estate member'
-    return {'id': str(report.id), 'title': report.title, 'description': report.description,
+    identity = {}
+    if is_caretaker(viewer):
+        identity = {
+            'reporter_id': str(report.reporter_id) if report.reporter_id else None,
+            'reporter_identity': report.reporter_name or (
+                (reporter.full_name or reporter.email) if reporter else None),
+        }
+    return {**identity, 'id': str(report.id), 'title': report.title, 'description': report.description,
             'location': report.location, 'severity': report.severity, 'status': report.status,
             'is_anonymous': report.is_anonymous, 'reporter_role': report.reporter_role,
             'reported_by_name': name, 'is_own': own, 'resolution_note': report.resolution_note,
@@ -69,7 +75,7 @@ async def create_report(db, user: User, body) -> dict:
                 {'type': 'incident_report', 'report_id': str(report.id)})
     await db.commit()
     await db.refresh(report)
-    return report_view(report, user)
+    return report_view(report, user, user)
 
 
 async def list_reports(db, user: User, status: str | None, severity: str | None, offset: int, limit: int) -> dict:
@@ -86,7 +92,14 @@ async def list_reports(db, user: User, status: str | None, severity: str | None,
     if is_caretaker(user):
         counts = dict((await db.execute(select(IncidentReport.status, func.count()).where(
             IncidentReport.app_id == user.app_id).group_by(IncidentReport.status))).all())
-    return {'reports': [report_view(r, user) for r in rows[:limit]], 'has_more': len(rows) > limit,
+    reporters = {}
+    if is_caretaker(user):
+        ids = {r.reporter_id for r in rows[:limit] if r.reporter_id and not r.reporter_name}
+        if ids:
+            accounts = (await db.execute(select(User).where(
+                User.id.in_(ids), User.app_id == user.app_id))).scalars()
+            reporters = {account.id: account for account in accounts}
+    return {'reports': [report_view(r, user, reporters.get(r.reporter_id)) for r in rows[:limit]], 'has_more': len(rows) > limit,
             'counts': {s: counts.get(s, 0) for s in ('open', 'investigating', 'resolved')}}
 
 
@@ -108,7 +121,11 @@ async def update_report(db, user: User, report_id, body) -> dict:
             {'type': 'incident_report', 'report_id': str(report.id), 'status': report.status})
     await db.commit()
     await db.refresh(report)
-    return report_view(report, user)
+    reporter = None
+    if report.reporter_id and not report.reporter_name:
+        reporter = await db.scalar(select(User).where(
+            User.id == report.reporter_id, User.app_id == user.app_id))
+    return report_view(report, user, reporter)
 
 
 def announcement_view(item: Announcement) -> dict:
@@ -128,13 +145,15 @@ async def create_announcement(db, user: User, body) -> dict:
                                        ~User.roles.contains([UserRole.SAAS_OWNER]), User.id != user.id)
     if body.audience != 'all':
         recipients = recipients.where(User.roles.contains([UserRole(body.audience)]))
+    if body.audience == UserRole.RESIDENT.value:
+        recipients = recipients.where(User.landlord_id.is_not(None))
     recipient_ids = (await db.execute(recipients)).scalars().all()
     item = Announcement(app_id=user.app_id, author_id=user.id, author_name=user.full_name or user.email,
                         title=body.title, body=body.body, category=body.category, audience=body.audience,
                         recipient_count=len(recipient_ids))
     db.add(item)
     await db.flush()
-    data = {'type': 'announcement', 'announcement_id': str(item.id), 'category': item.category}
+    data = {'type': 'announcement', 'announcement_id': str(item.id), 'category': item.category, 'app_id': user.app_id}
     for recipient_id in recipient_ids:
         await notification_inbox.record(db, recipient_id, user.app_id, f'announcement:{item.id}', item.title, item.body, data)
     await db.commit()

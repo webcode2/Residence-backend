@@ -20,6 +20,22 @@ async def read_all(db:AsyncSession=Depends(get_db),user:User=Depends(get_current
     await db.execute(update(AppNotification).where(AppNotification.user_id==user.id,AppNotification.app_id==user.app_id,AppNotification.is_read.is_(False)).values(is_read=True));await db.commit()
     return {'unread_count':await unread_count(db,user.id,user.app_id)}
 
+@router.get('/announcements/{announcement_id}')
+async def get_announcement_notification(
+    announcement_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    item = await db.scalar(select(AppNotification).where(
+        AppNotification.user_id == user.id,
+        AppNotification.app_id == user.app_id,
+        AppNotification.event_key == f'announcement:{announcement_id}',
+    ))
+    if item is None:
+        raise HTTPException(404, 'Notification not found.')
+    return {'id': str(item.id), 'title': item.title, 'body': item.body, 'data': item.data}
+
+
 class ReadEvent(BaseModel):
     event_key: str = Field(min_length=1,max_length=200)
 

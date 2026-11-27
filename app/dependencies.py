@@ -8,7 +8,7 @@ from app.core.database import get_db
 from app.models.user import User, UserRole
 from app.models.estate import Estate
 from app.schemas.user import TokenDataSchema
-from app.services.auth import token_matches_user
+from app.services.auth import token_matches_user, validate_session
 from datetime import datetime
 from typing import List
 import uuid
@@ -112,20 +112,30 @@ async def get_authenticated_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # 2. Fast-path: Check Redis user profile cache
+    # Session validity comes from PostgreSQL, independently of the profile cache.
+    row = (await db.execute(select(User.id, User.created_at, User.active_session_id, User.is_revoked).where(
+        User.email == token_data.email, User.app_id == token_data.app_id
+    ))).one_or_none()
+    if row is None:
+        raise credentials_exception
+    identity = User(id=row.id, created_at=row.created_at, active_session_id=row.active_session_id)
+    if not token_matches_user(payload, identity):
+        raise credentials_exception
+    if row.is_revoked:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account is revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not await validate_session(db, identity, payload, token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="This session has ended. Sign in again.",
+            headers={"WWW-Authenticate": "Bearer", "X-Session-Status": "replaced"},
+        )
+
     cached_user = await get_cached_user(token_data.app_id, token_data.email)
-    if cached_user and cached_user.get("v") != USER_CACHE_VERSION:
-        cached_user = None  # older cache shape lacks profile fields; refresh from Postgres
-    if cached_user and (payload.get("uid") or cached_user.get("created_at")):
-        cached_identity = User(id=uuid.UUID(cached_user["id"]), created_at=datetime.fromisoformat(cached_user["created_at"]) if cached_user.get("created_at") else None)
-        if not token_matches_user(payload, cached_identity):
-            raise credentials_exception
-        if cached_user.get("is_revoked", False):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User account is revoked",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+    if cached_user and cached_user.get("v") == USER_CACHE_VERSION and cached_user.get("id") == str(row.id):
         return User(
             id=uuid.UUID(cached_user["id"]),
             email=cached_user["email"],
@@ -145,30 +155,15 @@ async def get_authenticated_user(
             created_at=datetime.fromisoformat(cached_user["created_at"]) if cached_user.get("created_at") else None,
         )
 
-    # 3. Database Fallback on Cache Miss
-    result = await db.execute(
-        select(User).where(User.email == token_data.email, User.app_id == token_data.app_id)
-    )
-    user = result.scalar_one_or_none()
-    if user is None or not token_matches_user(payload, user):
+    user = await db.get(User, row.id)
+    if user is None:
         raise credentials_exception
-        
-    if user.is_revoked:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User account is revoked",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    # 4. Cache user in Redis for subsequent requests (30-minute TTL)
     await set_cached_user(
-        app_id=token_data.app_id,
-        email=token_data.email,
-        user_data=user_cache_payload(user),
-        ttl_seconds=1800
+        app_id=token_data.app_id, email=token_data.email,
+        user_data=user_cache_payload(user), ttl_seconds=1800,
     )
-
     return user
+
 
 async def get_current_user(
     current_user: User = Depends(get_authenticated_user),

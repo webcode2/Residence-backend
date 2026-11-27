@@ -342,6 +342,39 @@ async def verify_rfid_access(db: AsyncSession, rfid_tag: str, app_id: str) -> Op
     return {"status": "authorized", "user_id": str(user.id), "roles": roles}
 
 
+async def preview_visitor_token(db: AsyncSession, code: str, app_id: str) -> Optional[dict]:
+    """Read the guest and their host without claiming the code or recording access."""
+    code = code.strip().upper()
+    if await is_token_code_claimed(app_id, code):
+        return None
+    now = datetime.now(UTC).replace(tzinfo=None)
+    matches = await db.execute(
+        select(VisitorToken, User.full_name)
+        .outerjoin(User, (User.id == VisitorToken.resident_id) & (User.app_id == app_id))
+        .where(
+            VisitorToken.app_id == app_id,
+            or_(
+                (VisitorToken.code == code) & (VisitorToken.expires_at > now)
+                & (VisitorToken.status == "pending") & (VisitorToken.is_used.is_(False)),
+                (VisitorToken.bookout_code == code) & (VisitorToken.bookout_expires_at > now)
+                & VisitorToken.status.in_(["pending", "checked_in"]),
+            ),
+        )
+        .order_by((VisitorToken.bookout_code == code).desc().nulls_last(), VisitorToken.created_at.desc())
+    )
+    for token, host_name in matches:
+        live = await get_token_live_status(str(token.id))
+        effective_status = (live or {}).get("status") or token.status
+        is_exit = token.bookout_code == code
+        if effective_status == ("checked_in" if is_exit else "pending"):
+            return {
+                "action": "book_out" if is_exit else "check_in",
+                "visitor_name": token.visitor_name,
+                "host_name": host_name.strip() if host_name else None,
+            }
+    return None
+
+
 async def verify_visitor_token(
     db: AsyncSession,
     code: str,

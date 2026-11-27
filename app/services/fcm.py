@@ -173,6 +173,25 @@ class FCMService:
                     'click_action': 'FLUTTER_NOTIFICATION_CLICK', **({'notification_count': int(data['notification_count'])} if data.get('notification_count') is not None else {})}},
                 'apns': {'headers': {'apns-priority': '10', 'apns-expiration': str(int(expiry if live else time.time()+2419200))},
                     'payload': {'aps': {'sound': 'sos_alarm.wav' if live else 'default', 'content-available': 1, **({'badge': int(data['notification_count'])} if data.get('notification_count') is not None else {})}}}}}
+        if str_data.get('type') == 'announcement':
+            # The inbox retains the full text. Limit the OS preview to fit the FCM payload.
+            preview = body[:400] + ('…' if len(body) > 400 else '')
+            return {'message': {
+                'token': token,
+                'notification': {'title': title, 'body': preview},
+                'data': str_data,
+                'android': {
+                    'priority': 'HIGH' if high_priority else 'NORMAL',
+                    'notification': {
+                        'channel_id': 'residence_announcements_urgent' if high_priority else 'residence_announcements_maintenance',
+                        'tag': f"announcement:{str_data['announcement_id']}",
+                    },
+                },
+                'apns': {
+                    'headers': {'apns-push-type': 'alert', 'apns-priority': '10' if high_priority else '5'},
+                    'payload': {'aps': {'sound': 'default'} if high_priority else {}},
+                },
+            }}
         return {"message": {"token": token, "notification": {"title": title, "body": body}, "data": str_data,
             "android": {"priority": "HIGH" if high_priority else "NORMAL", "ttl": "2419200s",
                 "notification": {"channel_id": settings.FCM_ANDROID_CHANNEL_ID, "sound": "default", "click_action": "FLUTTER_NOTIFICATION_CLICK", **({"notification_count": int(data["notification_count"])} if data and data.get("notification_count") is not None else {})}},

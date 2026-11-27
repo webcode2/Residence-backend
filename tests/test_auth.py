@@ -50,6 +50,29 @@ async def test_login_success(client, db_session):
     assert response.json()["user"]["landlord_id"] is None
     assert response.json()["user"]["created_at"] is not None
 
+    first = {**headers, "Authorization": "Bearer " + response.json()["token"]["access_token"]}
+    profile_url = "/api/v1/users/me/profile"
+    push_url = "/api/v1/users/me/fcm-token"
+    assert (await client.get(profile_url, headers=first)).status_code == 200
+    assert (await client.post(push_url, headers=first, json={"fcm_token": "old-device-token"})).status_code == 200
+
+    second_login = await client.post("/api/v1/auth/login", json=login_data, headers=headers)
+    assert second_login.status_code == 200
+    second = {**headers, "Authorization": "Bearer " + second_login.json()["token"]["access_token"]}
+    replaced = await client.get(profile_url, headers=first)
+    assert replaced.status_code == 401
+    assert replaced.headers["X-Session-Status"] == "replaced"
+    assert (await client.get(profile_url, headers=second)).status_code == 200
+
+    from sqlalchemy import select
+    from app.models.sos import PushDevice
+    assert not (await db_session.scalars(select(PushDevice.token).where(PushDevice.user_id == user.id))).all()
+    assert (await client.post(push_url, headers=first, json={"fcm_token": "old-device-token"})).status_code == 401
+    assert (await client.post("/api/v1/auth/logout", headers=first)).status_code == 401
+    for rotated in ("new-device-token", "rotated-device-token"):
+        assert (await client.post(push_url, headers=second, json={"fcm_token": rotated})).status_code == 200
+    assert (await db_session.scalars(select(PushDevice.token).where(PushDevice.user_id == user.id))).all() == ["rotated-device-token"]
+
 @pytest.mark.asyncio
 async def test_login_invalid_credentials(client, db_session):
     estate_id = uuid.uuid4()

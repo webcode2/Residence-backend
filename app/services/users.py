@@ -193,18 +193,18 @@ async def delete_user(db: AsyncSession, user_id: uuid.UUID, app_id: str):
 
     return action
 
-async def update_user_fcm_token(db: AsyncSession, user_id: uuid.UUID, fcm_token: str) -> bool:
+async def update_user_fcm_token(db: AsyncSession, user_id: uuid.UUID, fcm_token: str, *, active_session: str | None = None) -> bool:
     """Updates and persists the FCM device push notification token for the user."""
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if not user:
+    user = await db.get(User, user_id, with_for_update=True, populate_existing=True)
+    if not user or (active_session is not None and user.active_session_id != active_session):
         return False
+    from sqlalchemy.dialects.postgresql import insert
     from app.models.sos import PushDevice
-    device = await db.get(PushDevice, fcm_token)
-    if device:
-        device.user_id = user_id
-    else:
-        db.add(PushDevice(token=fcm_token, user_id=user_id))
+
+    await db.execute(delete(PushDevice).where(
+        PushDevice.user_id == user_id, PushDevice.token != fcm_token))
+    await db.execute(insert(PushDevice).values(token=fcm_token, user_id=user_id)
+                     .on_conflict_do_update(index_elements=[PushDevice.token], set_={"user_id": user_id}))
     # A physical device must stop receiving alerts for its previous account.
     from sqlalchemy import update
     await db.execute(update(User).where(User.fcm_token==fcm_token,User.id!=user_id).values(fcm_token=None))

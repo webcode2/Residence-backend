@@ -12,6 +12,7 @@ Every Redis operation degrades to an in-process store when Redis is unreachable 
 single-worker deployment (and local dev) keeps working.
 """
 import asyncio
+from collections.abc import Awaitable, Callable
 import json
 import logging
 import time
@@ -178,18 +179,22 @@ class PresenceStore:
 
 @dataclass(eq=False)
 class ChatConnection:
-    """One live WebSocket. A user may hold several (phone + tablet)."""
+    """One live WebSocket for the active account session."""
 
     websocket: Any
     user_id: str
     app_id: str
     roles: Set[str] = field(default_factory=set)
+    authorize: Optional[Callable[[], Awaitable[bool]]] = None
     room: Optional[str] = None
     _send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def send_json(self, payload: Dict[str, Any]) -> bool:
         async with self._send_lock:
             try:
+                if self.authorize and not await self.authorize():
+                    await self.websocket.close(code=4401)
+                    return False
                 await self.websocket.send_json(payload)
                 return True
             except Exception as e:

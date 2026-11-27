@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Optional
+from typing import Literal, Optional
 from app.core.database import get_db
 from app.services import verification as verify_service
 from app.dependencies import validate_tenant, check_roles
@@ -39,6 +39,43 @@ async def verify_rfid(
     await _notify_visitor_access(db, app_id, result)
     return result
 
+@router.get("/token-preview/{code}", tags=["profiling"])
+async def preview_token(
+    code: str,
+    response: Response,
+    app_id: str = Depends(validate_tenant),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(check_roles([UserRole.SECURITY])),
+):
+    """Show who the guest is visiting before the guard approves access."""
+    result = await verify_service.preview_visitor_token(db, code, app_id)
+    if result is None:
+        denial = await _token_denial(db, app_id, code)
+        denial.headers["Cache-Control"] = "no-store"
+        raise denial
+    response.headers["Cache-Control"] = "no-store"
+    return result
+
+
+@router.post("/token/{code}/approve", tags=["profiling"])
+async def approve_token(
+    code: str,
+    direction: Literal["entry", "exit"] = Query(...),
+    app_id: str = Depends(validate_tenant),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(check_roles([UserRole.SECURITY])),
+):
+    """Record the access action explicitly approved by the guard."""
+    preview = await verify_service.preview_visitor_token(db, code, app_id)
+    if preview is None:
+        raise await _token_denial(db, app_id, code)
+    expected = "check_in" if direction == "entry" else "book_out"
+    if preview["action"] != expected:
+        raise HTTPException(409, "Token action changed. Look up the token again.")
+    result = await verify_token(code, direction, app_id, db, current_user)
+    return {**result, "host_name": preview["host_name"]}
+
+
 @router.get("/token/{code}", tags=["profiling"])
 async def verify_token(
     code: str,
@@ -72,29 +109,43 @@ async def verify_bookout(
 
 
 async def _notify_visitor_access(db, app_id, result):
-    """Dispatch a push after successful verification; no client polling needed."""
-    import asyncio
+    """Save the resident's inbox entry and queue a push for successful access."""
     import uuid
     from sqlalchemy import select
     from app.models.user import User
-    from app.services.fcm import fcm_service
-    if result.get('action') not in ('check_in', 'book_out') or not result.get('resident_id'):
+    from app.services import notification_queue
+    from app.services.notification_inbox import record, unread_count
+
+    action = result.get('action')
+    if action not in ('check_in', 'book_out') or not result.get('resident_id'):
         return
     resident = (await db.execute(select(User).where(
         User.id == uuid.UUID(str(result['resident_id'])), User.app_id == app_id,
         User.is_revoked.is_(False),
     ))).scalar_one_or_none()
-    if resident:
-        from app.services.notification_inbox import record, unread_count
-        notification_id=str(uuid.uuid4())
-        await record(db,resident.id,app_id,'access:'+notification_id,'Visitor departure' if result['action']=='book_out' else 'Visitor arrival',result.get('message','Visitor access updated'),{'type':'visitor_access','action':result['action'],'app_id':app_id})
-        await db.commit()
-    if resident and resident.fcm_token:
-        from app.services import notification_queue as notify_queue
-        await notify_queue.dispatch(
+    if resident is None:
+        return
+
+    visitor = (result.get('visitor_name') or '').strip() or 'Your visitor'
+    if action == 'book_out':
+        title = 'Visitor departure'
+        body = f'{visitor} checked out at the gate.'
+    else:
+        title = 'Visitor arrival'
+        body = f'{visitor} checked in at the gate.'
+
+    event_key = f'access:{uuid.uuid4()}'
+    data = {
+        'type': 'visitor_access', 'action': action, 'app_id': app_id,
+        'notification_event_key': event_key,
+    }
+    await record(db, resident.id, app_id, event_key, title, body, data)
+    await db.commit()
+    if resident.fcm_token:
+        await notification_queue.dispatch(
             'push',
             token=resident.fcm_token,
-            title='Visitor departure' if result['action'] == 'book_out' else 'Visitor arrival',
-            body=result.get('message', 'Visitor access updated'),
-            data={'type': 'visitor_access', 'action': result['action'], 'app_id': app_id, 'notification_count': await unread_count(db,resident.id,app_id)},
+            title=title,
+            body=body,
+            data={**data, 'notification_count': await unread_count(db, resident.id, app_id)},
         )

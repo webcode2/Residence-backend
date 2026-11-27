@@ -1,5 +1,6 @@
 from pydantic import BaseModel, EmailStr
 from fastapi import APIRouter, Depends, HTTPException, status, Request
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.services import auth as auth_service
@@ -59,6 +60,13 @@ async def login_for_access_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Serialize concurrent logins and push registration for this account.
+    authenticated_password = user.hashed_password
+    user = await db.scalar(select(User).where(User.id == user.id).with_for_update()
+                           .execution_options(populate_existing=True))
+    if user is None or user.hashed_password != authenticated_password:
+        raise HTTPException(401, "Credentials changed. Sign in again.")
+
     # Reset failure counter on success
     await reset_login_failures(rate_key)
 
@@ -73,8 +81,14 @@ async def login_for_access_token(
             headers={"X-Account-Status": "suspended"} if reinstatement_eligible(user) else None,
         )
 
+    active_session = uuid.uuid4().hex
+    user.active_session_id = active_session
+    await auth_service.clear_session_devices(db, user)
+    await db.commit()
+    await db.refresh(user)
+
     access_token = auth_service.create_access_token(
-        data={"sub": user.email, "uid": str(user.id), "app_id": app_id, "roles": [role.value for role in user.roles], "purpose": "password_change" if user.must_change_password else "access", "jti": str(uuid.uuid4())},
+        data={"sub": user.email, "uid": str(user.id), "app_id": app_id, "roles": [role.value for role in user.roles], "purpose": "password_change" if user.must_change_password else "access", "sid": active_session, "jti": str(uuid.uuid4())},
         expires_delta=timedelta(minutes=30) if user.must_change_password else timedelta(days=settings.TENANT_SESSION_DAYS)
     )
 
@@ -123,13 +137,21 @@ async def request_reinstatement(
 @router.post("/logout", tags=["auth"])
 async def logout(
     token: str = Depends(oauth2_scheme),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     Logout user, blacklist active JWT in Redis, and clear user session cache.
     """
     from app.core.redis import blacklist_token, invalidate_cached_user
 
+    from jose import jwt
+    claims = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    user = await db.get(User, current_user.id, with_for_update=True, populate_existing=True)
+    if user and user.active_session_id == auth_service.session_id(claims, token):
+        user.active_session_id = uuid.uuid4().hex
+        await auth_service.clear_session_devices(db, user)
+        await db.commit()
     await blacklist_token(token, ttl_seconds=_remaining_token_seconds(token))
     await invalidate_cached_user(current_user.app_id, current_user.email)
     return {"status": "success", "message": "Successfully logged out and token invalidated"}
@@ -144,7 +166,12 @@ async def change_password(
     db: AsyncSession = Depends(get_db),
 ):
     from app.core.redis import invalidate_cached_user, blacklist_token
-    user = await db.get(User, current_user.id, populate_existing=True)
+    from jose import jwt
+    claims = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    active_session = auth_service.session_id(claims, token)
+    user = await db.get(User, current_user.id, with_for_update=True, populate_existing=True)
+    if not user or user.active_session_id != active_session:
+        raise HTTPException(401, "This session has ended. Sign in again.")
     if not user or not await auth_service.verify_password_async(body.current_password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
     auth_service.require_acceptable_password(body.new_password)
@@ -157,7 +184,7 @@ async def change_password(
     await invalidate_cached_user(user.app_id, user.email)
     await blacklist_token(token, ttl_seconds=_remaining_token_seconds(token))
     fresh = auth_service.create_access_token({"sub": user.email, "uid": str(user.id), "app_id": user.app_id,
-        "roles": [r.value for r in user.roles], "purpose": "access", "jti": str(uuid.uuid4())}, expires_delta=timedelta(days=settings.TENANT_SESSION_DAYS))
+        "roles": [r.value for r in user.roles], "purpose": "access", "sid": active_session, "jti": str(uuid.uuid4())}, expires_delta=timedelta(days=settings.TENANT_SESSION_DAYS))
     from app.models.estate import Estate
     from sqlalchemy import select
     length = (await db.execute(select(Estate.token_code_length).where(Estate.app_id == user.app_id))).scalar_one_or_none() or 6
