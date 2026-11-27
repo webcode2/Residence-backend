@@ -18,6 +18,7 @@ from app.services.chat import drain_chat_message_queue
 from app.services.landlords import _run as landlord_onboarding_loop
 from app.services.sos import _loop as sos_outbox_loop
 from app.services.history_jobs import _run as history_jobs_loop
+from app.services.account_password_resets import _run as credential_email_loop
 # Register all ORM models so FK resolution works during batch inserts
 from app.models import estate, user, token, access_log, chat, onboarding, history, sos  # noqa: F401
 
@@ -96,7 +97,8 @@ async def run_daemon():
     setup_logging()
     stop_event = asyncio.Event()
     logger.info(
-        "Starting standalone worker daemon (queue drain + maintenance + landlord onboarding + sos outbox + history jobs)..."
+        "Starting standalone worker daemon (queue drain + maintenance + landlord onboarding + sos outbox"
+        " + history jobs + credential emails)..."
     )
     tasks = [
         asyncio.create_task(_queue_drain_loop(stop_event), name="worker.queue_drain"),
@@ -104,6 +106,7 @@ async def run_daemon():
         asyncio.create_task(landlord_onboarding_loop(), name="worker.landlord_onboarding"),
         asyncio.create_task(sos_outbox_loop(), name="worker.sos_outbox"),
         asyncio.create_task(history_jobs_loop(), name="worker.history_jobs"),
+        asyncio.create_task(credential_email_loop(), name="worker.credential_emails"),
     ]
     try:
         await asyncio.gather(*tasks)

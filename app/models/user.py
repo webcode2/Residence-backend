@@ -35,6 +35,7 @@ class User(Base, ModelMixin, TenantMixin):
     rfid_tag: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=True)
     house_number: Mapped[str] = mapped_column(String(20), nullable=True)
     street_name: Mapped[str] = mapped_column(String(100), nullable=True)
+    active_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     fcm_token: Mapped[str] = mapped_column(String(512), nullable=True, index=True)
     is_revoked: Mapped[bool] = mapped_column(Boolean, default=False)
     
@@ -47,5 +48,18 @@ class User(Base, ModelMixin, TenantMixin):
         Index("ix_users_app_id_rfid_tag", "app_id", "rfid_tag"),
         Index("ix_users_app_id_email", "app_id", "email", unique=True),
     )
+
+
+class SecurityStaffProfile(Base, ModelMixin, TenantMixin):
+    """Employment details a caretaker keeps for a security officer (one row per officer)."""
+    __tablename__ = "security_staff_profiles"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True)
+    staff_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    alternate_phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    home_address: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    emergency_contact_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    emergency_contact_phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    notes: Mapped[str | None] = mapped_column(String(1000), nullable=True)
 
 

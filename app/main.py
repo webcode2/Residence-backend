@@ -36,7 +36,9 @@ async def lifespan(app: FastAPI):
         start_onboarding_worker()
         from app.services.history_jobs import start_worker as start_history_worker
         start_history_worker()
-        logger.info("Embedded background workers started (sos, landlords, history_jobs)")
+        from app.services.account_password_resets import start_worker as start_credential_worker
+        start_credential_worker()
+        logger.info("Embedded background workers started (sos, landlords, history_jobs, credential emails)")
     else:
         logger.info("Embedded background workers disabled; expecting dedicated worker process")
     start_maintenance_scheduler()
@@ -51,6 +53,8 @@ async def lifespan(app: FastAPI):
         await stop_onboarding_worker()
         from app.services.history_jobs import stop_worker as stop_history_worker
         await stop_history_worker()
+        from app.services.account_password_resets import stop_worker as stop_credential_worker
+        await stop_credential_worker()
     await chat_hub.stop()
     await stop_maintenance_scheduler()
     await close_redis()

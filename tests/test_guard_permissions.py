@@ -14,13 +14,13 @@ async def accounts(db_session):
     db_session.add(Subscription(estate_id=estate.id, status='active', expiry_date=date.today()+timedelta(days=10), tier='standard', rfid_enabled=True))
     users = {}
     for role in [UserRole.RESIDENT, UserRole.LANDLORD, UserRole.CARETAKER, UserRole.SECURITY]:
-        user = User(email=uuid.uuid4().hex+'@example.com', hashed_password=get_password_hash('test-password'), roles=[role], app_id=app_id, rfid_tag=uuid.uuid4().hex)
+        user = User(email=uuid.uuid4().hex+'@example.com', hashed_password=get_password_hash('test-password'), roles=[role], app_id=app_id, rfid_tag=uuid.uuid4().hex, active_session_id=uuid.uuid4().hex)
         db_session.add(user)
         users[role] = user
     await db_session.commit()
     def headers(role):
         user = users[role]
-        return {'X-App-Id':app_id, 'Authorization':'Bearer '+create_access_token({'sub':user.email,'app_id':app_id,'roles':[role.value]})}
+        return {'X-App-Id':app_id, 'Authorization':'Bearer '+create_access_token({'sub':user.email,'uid':str(user.id),'sid':user.active_session_id,'app_id':app_id,'roles':[role.value]})}
     return app_id, users, headers
 
 @pytest.mark.asyncio
@@ -65,7 +65,7 @@ async def test_directory_password_reset_is_durable_and_requires_change(client, d
     path = f'/api/v1/users/{host.id}'
     caretaker = headers(UserRole.CARETAKER)
     send = AsyncMock(side_effect=[False, True])
-    monkeypatch.setattr(account_password_resets.notification_service, 'send_staff_welcome_email', send)
+    monkeypatch.setattr(account_password_resets.notification_service, 'send_credential_email', send)
 
     assert (await client.patch(path, json={'reset_password': True},
                                headers=headers(UserRole.RESIDENT))).status_code == 403
@@ -125,7 +125,24 @@ async def test_directory_password_reset_is_durable_and_requires_change(client, d
     assert complete.json()['user']['must_change_password'] is False
 
 @pytest.mark.asyncio
-async def test_directory_removal_archives_and_suspends_account(client, accounts):
+async def test_host_and_resident_suspensions_require_a_reason(client, accounts):
+    _, users, headers = accounts
+    caretaker = headers(UserRole.CARETAKER)
+    for role in (UserRole.LANDLORD, UserRole.RESIDENT):
+        path = f'/api/v1/users/{users[role].id}/status'
+        assert (await client.patch(path, headers=caretaker, json={'is_revoked': True})).status_code == 422
+        suspended = await client.patch(path, headers=caretaker, json={
+            'is_revoked': True, 'reason': 'Account access review',
+        })
+        assert suspended.status_code == 200 and suspended.json()['is_revoked']
+        restored = await client.patch(path, headers=caretaker, json={'is_revoked': False})
+        assert restored.status_code == 200 and not restored.json()['is_revoked']
+
+
+@pytest.mark.asyncio
+async def test_directory_removal_archives_and_suspends_account(client, db_session, accounts):
+    from sqlalchemy import select
+    from app.models.admin_audit import AdminAuditLog
     app_id, users, headers = accounts
     resident = users[UserRole.RESIDENT]
     caretaker = headers(UserRole.CARETAKER)
@@ -134,7 +151,9 @@ async def test_directory_removal_archives_and_suspends_account(client, accounts)
 
     denied = await client.patch(path, headers=original)
     assert denied.status_code == 403
-    archived = await client.patch(path, headers=caretaker)
+    assert (await client.patch(path, headers=caretaker)).status_code == 422
+    assert (await client.get('/api/v1/users/me/profile', headers=original)).status_code == 200
+    archived = await client.patch(path, headers=caretaker, json={'reason': '  End of tenancy  '})
     assert archived.status_code == 200, archived.text
 
     directory = await client.get('/api/v1/landlords/', headers=caretaker)
@@ -147,6 +166,12 @@ async def test_directory_removal_archives_and_suspends_account(client, accounts)
     assert (await client.patch(path, headers=caretaker)).status_code == 200
     assert (await client.get('/api/v1/users/archive', headers=caretaker)).json()[0]['archived_at'] == initial_date
     assert (await client.get('/api/v1/users/me/profile', headers=original)).status_code == 401
+    audit = (await db_session.execute(select(AdminAuditLog).where(
+        AdminAuditLog.action == 'user.archive', AdminAuditLog.target_id == str(resident.id),
+    ))).scalar_one()
+    assert audit.actor_id == users[UserRole.CARETAKER].id
+    assert audit.changes['reason']['after'] == 'End of tenancy'
+
 
 @pytest.mark.asyncio
 async def test_archive_hold_is_caretaker_only_and_closes_after_thirty_days(client, db_session, accounts):
@@ -158,7 +183,7 @@ async def test_archive_hold_is_caretaker_only_and_closes_after_thirty_days(clien
     host = users[UserRole.LANDLORD]
     for account in (resident, host):
         assert (await client.patch(f'/api/v1/users/{account.id}/archive',
-                                   headers=caretaker)).status_code == 200
+                                   headers=caretaker, json={'reason': 'End of tenancy'})).status_code == 200
     host.archived_at = utc_now() - timedelta(days=30)
     await db_session.commit()
 
@@ -166,8 +191,8 @@ async def test_archive_hold_is_caretaker_only_and_closes_after_thirty_days(clien
     assert (await client.patch(path)).status_code == 401
     assert (await client.patch(f'/api/v1/users/{host.id}/archive/hold',
                                headers=caretaker)).status_code == 409
-    assert (await client.patch(path, headers=caretaker)).status_code == 200
-    assert (await client.patch(path, headers=caretaker)).status_code == 200
+    assert (await client.patch(path, headers=caretaker, json={'reason': 'End of tenancy'})).status_code == 200
+    assert (await client.patch(path, headers=caretaker, json={'reason': 'End of tenancy'})).status_code == 200
     response = await client.get('/api/v1/users/archive', headers=caretaker)
     rows = {row['id']: row for row in response.json()}
     assert rows[str(resident.id)]['hold_at'] is not None
@@ -184,12 +209,12 @@ async def test_reinstatement_and_same_email_registration_are_separate(client, ac
     original_headers = headers(UserRole.RESIDENT)
     path = f'/api/v1/users/{resident.id}/archive'
 
-    assert (await client.patch(path, headers=caretaker)).status_code == 200
+    assert (await client.patch(path, headers=caretaker, json={'reason': 'End of tenancy'})).status_code == 200
     assert (await client.patch(path + '/reinstate', headers=caretaker)).status_code == 200
     active = (await client.get('/api/v1/landlords/', headers=caretaker)).json()
     assert any(row['id'] == str(resident.id) for row in active)
     assert (await client.get('/api/v1/users/archive', headers=caretaker)).json() == []
-    assert (await client.patch(path, headers=caretaker)).status_code == 200
+    assert (await client.patch(path, headers=caretaker, json={'reason': 'End of tenancy'})).status_code == 200
     assert (await client.patch(path + '/hold', headers=caretaker)).status_code == 200
     retained = (await client.get('/api/v1/users/archive', headers=caretaker)).json()[0]
     assert retained['email'] == original_email and retained['hold_at']
@@ -227,7 +252,7 @@ async def test_archive_purge_removes_due_records_and_keeps_holds(client, db_sess
     caretaker = headers(UserRole.CARETAKER)
     for person in (resident, host):
         assert (await client.patch(f'/api/v1/users/{person.id}/archive',
-                                   headers=caretaker)).status_code == 200
+                                   headers=caretaker, json={'reason': 'End of tenancy'})).status_code == 200
     assert (await client.patch(f'/api/v1/users/{host_id}/archive/hold',
                                headers=caretaker)).status_code == 200
     log = AccessLog(app_id=app_id, resident_id=resident_id, event_type='entry',
@@ -261,7 +286,7 @@ async def test_public_reinstatement_request_emails_caretaker_once(client, accoun
     send = AsyncMock()
     monkeypatch.setattr(notification_queue, 'dispatch', send)
     assert (await client.patch(f'/api/v1/users/{resident.id}/archive',
-                               headers=admin_headers)).status_code == 200
+                               headers=admin_headers, json={'reason': 'End of tenancy'})).status_code == 200
     for email in (resident.email, resident.email.upper(), 'unrelated@example.com'):
         response = await client.post('/api/v1/auth/request-reinstatement',
                                      json={'email': email}, headers={'X-App-Id': app_id})

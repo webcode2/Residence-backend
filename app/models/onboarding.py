@@ -34,8 +34,13 @@ class LandlordImportFile(Base, ModelMixin, TenantMixin):
     deleted_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
 
 class AccountPasswordResetJob(Base, ModelMixin, TenantMixin):
+    """Credential email for an existing estate account (officer welcome or password reset).
+
+    The temporary password becomes the account password only after Resend accepts the email.
+    """
     __tablename__ = "account_password_reset_jobs"
 
+    kind: Mapped[str] = mapped_column(String(20), default="reset", server_default="reset")  # reset | staff_welcome
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     email: Mapped[str] = mapped_column(String(255))
     previous_password_fingerprint: Mapped[str] = mapped_column(String(64))

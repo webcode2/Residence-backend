@@ -11,8 +11,10 @@ Kinds:
   email_alert   real-time alert email {email, title, message}
   chat_push     chat FCM fallback     {dispatch: ChatDispatch as dict}
   settings_sync silent estate-settings invalidation push {tokens, app_id}
-  staff_welcome security staff credentials email {email, password_ciphertext, full_name,
-                app_id, idempotency_key}; the password is Fernet-encrypted while queued
+
+Credential emails (temporary passwords) never use this queue: they are durable Postgres
+jobs in `account_password_resets`. `staff_welcome` is only read here so items queued by
+older releases are still delivered.
 """
 import asyncio
 import json
@@ -44,11 +46,11 @@ async def _run(kind: str, args: Dict[str, Any]) -> bool:
         return True
     if kind == "email_alert":
         return bool(await notification_service.send_realtime_access_alert(args["email"], args["title"], args["message"]))
-    if kind == "staff_welcome":
+    if kind == "staff_welcome":  # legacy: queued before credential emails moved to Postgres
         from app.services.landlords import cipher
         password = cipher().decrypt(args["password_ciphertext"].encode()).decode()
-        return bool(await notification_service.send_staff_welcome_email(
-            args["email"], password, args.get("full_name", ""), args.get("app_id", ""),
+        return bool(await notification_service.send_credential_email(
+            "staff_welcome", args["email"], password, args.get("full_name", ""), args.get("app_id", ""),
             idempotency_key=args.get("idempotency_key")))
     if kind == "settings_sync":
         from app.services import estate_settings_sync

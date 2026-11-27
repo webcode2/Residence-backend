@@ -45,6 +45,18 @@ The top-level `residence/` folder is not a git repo.
   commits. To add one from `.env`, write it to a temp file, `gcloud secrets versions add
   --data-file`, delete the file. `.env`, `.env.local`, Firebase admin key and
   `.seed*.json` are git-ignored and excluded by `.gcloudignore`.
+- **Runtime settings live on the Cloud Run services, not in `.env`.** `.env` is never in
+  the image, and `gcloud run deploy --image` keeps each service's existing env vars. To
+  change a setting, run `gcloud run services update <svc> --update-env-vars ...` on
+  **both** `residence-api` and `residence-worker`.
+- Both services must route 100% of traffic to the **latest** revision. A pinned revision
+  silently ignores new deploys and settings (this hid the email-sender fix on 27 Nov
+  2026). Check with `gcloud run services describe <svc> --format='yaml(status.traffic)'`;
+  fix with `gcloud run services update-traffic <svc> --to-latest`.
+- Email: Resend, sender `Support <noreply@residence.elastrocloud.com>` (domain
+  `residence.elastrocloud.com` verified in Resend). Never use `onboarding@resend.dev`:
+  Resend rejects it (403) for every recipient except the Resend account owner. The
+  `RESEND_API_KEY` secret is send-only.
 
 ### Measured latency (from Cloud Run us-east5)
 Postgres round trip ~22 ms; typical 1-query request ~66 ms; Redis GET/SET ~24 ms. GCP
@@ -68,8 +80,20 @@ FCM pushes, exports, purges, gate access logs, visitor-token state, chat persist
   own next wake for future retries, then sleeps.
 - Notifications use `notification_queue.dispatch(kind, ...)`
   (`app/services/notification_queue.py`): kinds `push`, `push_many`, `email_alert`,
-  `chat_push`, `settings_sync`, `staff_welcome`. Without a worker configured
-  (local/tests) they are sent before the request returns.
+  `chat_push`, `settings_sync` (`staff_welcome` is only read for items queued by older
+  releases). Without a worker configured (local/tests) they are sent before the
+  request returns.
+- **Every email goes through `ResendClient.send`** (`app/services/notifications.py`),
+  which returns True only when Resend accepts it and logs Resend's reason otherwise.
+  **Credential emails** (temporary passwords) share one template,
+  `send_credential_email(kind, ...)`, and are sent only from durable Postgres jobs:
+  - `account_password_resets` (table `account_password_reset_jobs`, column `kind`):
+    `staff_welcome` (officer registered) and `reset` (directory or Security staff page
+    reset). The temporary password becomes the account password **only after Resend
+    accepts the email**; failures retry with backoff (up to hourly) indefinitely.
+  - `landlords` (table `landlord_onboarding_jobs`): host import welcome
+    (`host_welcome`), which also creates the account and keeps per-row import status.
+  Never send a credential email through `notification_queue` (it drops after 3 tries).
 - **Never** do slow work inline in a request, and **never** use `asyncio.create_task` /
   `BackgroundTasks` for external calls: with request-only CPU they stall after the
   response. The owner explicitly rejected processing jobs inline ("SERVERLESS_MODE").
@@ -100,13 +124,24 @@ Build the profile entry only with `user_cache_payload()` in `app/core/redis.py`;
   `PASSWORD_MIN_LENGTH` in `app/services/auth.py`, mobile screens, Admin forms).
 - Estate sign-in matches email case-insensitively (exact match preferred; never guesses
   between two accounts differing only by case). Lockout counts all capitalisations.
+- An estate account has one active session across mobile and Admin. A successful
+  sign-in replaces the previous session and clears its push registration. Profile
+  and password changes preserve the active session while rotating its access token.
+  PostgreSQL is authoritative for session checks, including chat WebSockets.
 - **Platform owner** is created on container start from `PLATFORM_OWNER_EMAIL` /
   `PLATFORM_OWNER_PASSWORD` (secret) / `PLATFORM_OWNER_NAME` if missing; an existing
   account is never modified (`app/services/owner_bootstrap.py`). It is a separate
   `GLOBAL` account even if an estate login uses the same email.
 - **Security officers** are registered only by caretakers on the Admin *Security staff*
-  page (`POST /api/v1/security-staff`). They get a temporary password (shown once,
-  emailed via the worker) and are blocked from every endpoint until they set their own.
+  page (`POST /api/v1/security-staff`). They get a temporary password (shown once to
+  the caretaker, emailed via the `account_password_resets` job) that starts working only
+  once the email is accepted, and are blocked from every endpoint until they set their
+  own. A reset works the same way: the current password keeps working until the reset
+  email is accepted. The page shows each officer's email status.
+  Caretakers edit officers with `PATCH /api/v1/security-staff/{id}`: name, sign-in email,
+  phone, plus `security_staff_profiles` (staff ID, alternate phone, home address,
+  emergency contact, notes). Every change goes to the admin audit log. A changed email
+  signs the officer out; if they never signed in, a new welcome goes to the new address.
   Suspend/reinstate via `PATCH /users/{id}/status`; reset requires a confirmation dialog.
 - Estate directory caretakers can request a generated password reset on another
   estate account. Postgres stores a job ID and encrypted temporary password. The
