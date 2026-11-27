@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -70,7 +70,7 @@ async def login_for_access_token(
     # Reset failure counter on success
     await reset_login_failures(rate_key)
 
-    
+
     if user.is_revoked:
         # Only reached with the correct password, so this reveals nothing to guessers.
         # The header tells the app to offer "Request account reinstatement".
@@ -81,6 +81,11 @@ async def login_for_access_token(
             headers={"X-Account-Status": "suspended"} if reinstatement_eligible(user) else None,
         )
 
+    return await _start_session(db, user, app_id)
+
+
+async def _start_session(db: AsyncSession, user: User, app_id: str) -> dict:
+    """Make this the account's only session (one per account) and return the sign-in response."""
     active_session = uuid.uuid4().hex
     user.active_session_id = active_session
     await auth_service.clear_session_devices(db, user)
@@ -112,6 +117,76 @@ async def login_for_access_token(
         "user": user,
         "token_code_length": token_code_length,
     }
+
+
+class DeviceKeyEnrolRequest(BaseModel):
+    device_label: str | None = Field(None, max_length=100)
+
+
+class DeviceKeyLoginRequest(BaseModel):
+    key_id: uuid.UUID
+    secret: str = Field(min_length=20, max_length=200)
+
+
+@router.post("/device-keys", status_code=201)
+async def enrol_device_key(
+    body: DeviceKeyEnrolRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Turn on fingerprint / Face ID sign-in on this phone (residents only).
+
+    The secret is returned once; the app keeps it in secure storage behind a biometric check.
+    """
+    from app.services import device_keys
+
+    user = await db.get(User, current_user.id, with_for_update=True, populate_existing=True)
+    if user is None or not device_keys.eligible(user):
+        raise HTTPException(403, "Fingerprint sign-in is available on resident accounts only")
+    key, secret = await device_keys.enrol(db, user, body.device_label)
+    await db.commit()
+    return {"key_id": str(key.id), "secret": secret}
+
+
+@router.delete("/device-keys/{key_id}", status_code=204)
+async def revoke_device_key(
+    key_id: uuid.UUID,
+    current_user: User = Depends(get_authenticated_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Turn off fingerprint sign-in for this phone."""
+    from app.services import device_keys
+
+    await device_keys.revoke(db, current_user, key_id)
+    await db.commit()
+
+
+@router.post("/device-login", response_model=AuthResponseSchema)
+async def device_login(
+    body: DeviceKeyLoginRequest,
+    request: Request,
+    app_id: str = Depends(ValidateTenant(is_auth_route=True)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Sign in with the phone's fingerprint sign-in key. Replaces any other session."""
+    from app.services import device_keys
+
+    client_ip = request.client.host if request.client else "unknown"
+    rate_key = f"{app_id}:device:{body.key_id}:{client_ip}"
+    is_blocked, remaining = await check_login_blocked(rate_key)
+    if is_blocked:
+        raise HTTPException(429, f"Too many failed attempts. Please try again in {remaining} seconds.")
+    user = await device_keys.authenticate(db, app_id, body.key_id, body.secret)
+    if user is None:
+        await record_login_failure(rate_key)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Fingerprint sign-in is no longer set up for this account. Sign in with your password.",
+            headers={"X-Device-Key": "invalid"},
+        )
+    await reset_login_failures(rate_key)
+    return await _start_session(db, user, app_id)
+
 
 class ReinstatementRequest(BaseModel):
     email: EmailStr

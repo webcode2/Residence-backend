@@ -157,6 +157,12 @@ Build the profile entry only with `user_cache_payload()` in `app/core/redis.py`;
   days. It checks for retention holds under the account lock. Sign-in surfaces
   can request reinstatement by estate App ID and email. The request queues an
   email and records a notice for active estate caretakers. It does not grant access.
+- **Fingerprint sign-in (residents only):** `POST /auth/device-keys` issues one key per
+  account (a new phone retires the old key); `POST /auth/device-login` signs in with it
+  and replaces the session like a password sign-in; `DELETE /auth/device-keys/{id}` turns
+  it off. Only a SHA-256 of the secret is stored (`device_sign_in_keys`). A key stops
+  working when the password changes, or the account is suspended/archived or becomes a
+  guard. Security officers and the platform owner cannot enrol.
 - User-facing wording is **"Host / Property Owner"**; the stored role value, API paths
   (`/api/v1/landlords`) and DB tables keep `landlord` — do not rename those.
 
@@ -184,6 +190,16 @@ lib/
   presentation. Preserve the server's authorization checks.
 - Keep other code module-local unless both apps genuinely need it. Keep
   `GateVisitorStore` and the gate `visitor_pass` and `visitor_api` in `lib/gate/`.
+- **App lock is resident-only** (owner decision, 27 Nov 2026; the gate app has none).
+  `lib/resident/security/`: `ResidentLockGate` wraps the app in `main.dart` and skips
+  guard accounts; 6-digit app PIN (salted, iterated SHA-256 in secure storage), optional
+  fingerprint/Face ID (biometric only, not the phone passcode), account password as the
+  last fallback (5 wrong PINs require it). Lock timing: every time the app is left, or
+  after 30 s / 1 min / 5 min. Leaving the app always shows the privacy cover ("Unlock
+  Residence") in the app switcher. Our own fingerprint prompt must never count as leaving
+  the app, and the prompt opens automatically at most once per lock (this caused an
+  endless prompt loop before). Fingerprint sign-in lives in `lib/shared/auth/`
+  (`device_sign_in.dart`, login screen) because sign-in is shared.
 - **Gate-specific redesign work happens in `lib/gate/`.** Changes to common chat
   belong in `lib/shared/chat/` when they apply to both roles.
 

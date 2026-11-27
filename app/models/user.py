@@ -50,6 +50,24 @@ class User(Base, ModelMixin, TenantMixin):
     )
 
 
+class DeviceSignInKey(Base, ModelMixin, TenantMixin):
+    """Fingerprint / Face ID sign-in for one resident account on one phone.
+
+    The phone keeps the secret in secure storage and releases it only after a biometric
+    check. Only a SHA-256 of the secret is stored here. The key stops working when the
+    account password changes (fingerprint mismatch), when the account is suspended or
+    archived, or when the resident turns fingerprint sign-in off.
+    """
+    __tablename__ = "device_sign_in_keys"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    secret_hash: Mapped[str] = mapped_column(String(64))
+    password_fingerprint: Mapped[str] = mapped_column(String(64))
+    device_label: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class SecurityStaffProfile(Base, ModelMixin, TenantMixin):
     """Employment details a caretaker keeps for a security officer (one row per officer)."""
     __tablename__ = "security_staff_profiles"
